@@ -1,17 +1,19 @@
 ### TCP/S — прозрачное шифрование TCP на 4 уровне
 # Архитектура
-tpcs/  
-├── kernel/                    # Linux kernel module (LKM)  
-│   ├── tcps.h                 # Заголовок: состояния, структуры коннектов  
-│   ├── tcps_main.c            # Netfilter hooks (LOCAL_OUT + PRE_ROUTING)  
-│   ├── tcps_crypto.c          # Curve25519 + ChaCha20 для ядра  
-│   └── Makefile               # Сборка: make → tcps.ko  
-│  
-└── user/                      # Userspace LD_PRELOAD библиотека  
-    ├── tcps.c                 # Перехват socket/connect/accept/send/recv/close  
-    ├── tcps_crypto.c          # Curve25519 + ChaCha20 для userspace  
-    ├── test_server.c          # Обычный TCP-сервер (без TCPS API)  
+```
+tpcs/
+├── kernel/                    # Linux kernel module (LKM)
+│   ├── tcps.h                 # Заголовок: состояния, структуры коннектов
+│   ├── tcps_main.c            # Netfilter hooks (LOCAL_OUT + PRE_ROUTING)
+│   ├── tcps_crypto.c          # Curve25519 + ChaCha20 для ядра
+│   └── Makefile               # Сборка: make → tcps.ko
+│
+└── user/                      # Userspace LD_PRELOAD библиотека
+    ├── tcps.c                 # Перехват socket/connect/accept/send/recv/close
+    ├── tcps_crypto.c          # Curve25519 + ChaCha20 для userspace
+    ├── test_server.c          # Обычный TCP-сервер (без TCPS API)
     └── test_client.c          # Обычный TCP-клиент (без TCPS API)
+```
 Как работает<br>
 # Kernel module (tcps.ko):
 1. Netfilter hook LOCAL_OUT — добавляет TCP option TC (kind=253) в SYN-пакеты
