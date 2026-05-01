@@ -124,3 +124,7 @@ tcpdump -i ens18 -A -s0 tcp
 
 Без модуля тот же HTTP-запрос показал бы читаемый текст: `GET / HTTP/1.1`, заголовки, HTML.
 С модулем — только бинарный мусор. Приложения (curl, nginx) работают как обычно.
+
+---
+
+License — MIT. Use it, fork it, bypass censorship responsibly.
