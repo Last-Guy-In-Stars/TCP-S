@@ -56,10 +56,10 @@ struct tcps_conn {
 	uint8_t fin_in;
 	unsigned long last_active;
 
-	uint32_t last_send_seq;
-	uint32_t last_recv_seq;
 	uint32_t send_wrap;
 	uint32_t recv_wrap;
+	uint64_t max_send_pos;
+	uint64_t max_recv_pos;
 
 	struct hlist_node hnode;
 	struct rcu_head rcu;

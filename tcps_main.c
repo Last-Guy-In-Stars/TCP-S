@@ -46,32 +46,36 @@ static inline uint32_t tcps_hash4(__be32 a1, __be16 p1,
 static inline uint64_t tcps_send_pos(struct tcps_conn *c, uint32_t seq)
 {
 	uint32_t isn = c->is_client ? c->client_isn : c->server_isn;
-	uint64_t base = (uint64_t)c->send_wrap << 32;
-	return base + (uint64_t)(seq - isn - 1);
+	uint32_t offset = seq - isn - 1;
+	uint64_t pos = ((uint64_t)c->send_wrap << 32) + offset;
+
+	if (c->max_send_pos > 0 && pos + (1ULL << 31) < c->max_send_pos) {
+		c->send_wrap++;
+		pos += (1ULL << 32);
+	}
+	if (pos > c->max_send_pos)
+		c->max_send_pos = pos;
+
+	return pos;
 }
 
 static inline uint64_t tcps_recv_pos(struct tcps_conn *c, uint32_t seq)
 {
 	uint32_t isn = c->is_client ? c->server_isn : c->client_isn;
-	uint64_t base = (uint64_t)c->recv_wrap << 32;
-	return base + (uint64_t)(seq - isn - 1);
-}
+	uint32_t offset = seq - isn - 1;
+	uint64_t pos = ((uint64_t)c->recv_wrap << 32) + offset;
 
-static inline void tcps_update_send_wrap(struct tcps_conn *c, uint32_t seq)
-{
-	int32_t diff = (int32_t)(seq - c->last_send_seq);
-	if (diff < 0 && c->last_send_seq != 0)
-		c->send_wrap++;
-	c->last_send_seq = seq;
-}
-
-static inline void tcps_update_recv_wrap(struct tcps_conn *c, uint32_t seq)
-{
-	int32_t diff = (int32_t)(seq - c->last_recv_seq);
-	if (diff < 0 && c->last_recv_seq != 0)
+	if (c->max_recv_pos > 0 && pos + (1ULL << 31) < c->max_recv_pos) {
 		c->recv_wrap++;
-	c->last_recv_seq = seq;
+		pos += (1ULL << 32);
+	}
+	if (pos > c->max_recv_pos)
+		c->max_recv_pos = pos;
+
+	return pos;
 }
+
+
 
 struct tcps_conn *tcps_conn_find_any(__be32 a1, __be16 p1,
 				     __be32 a2, __be16 p2)
@@ -428,7 +432,7 @@ static int add_mac_option(struct sk_buff *skb, const uint8_t tag[TCPS_MAC_TAG_SI
 	iph = ip_hdr(skb);
 	th = tcp_hdr(skb);
 
-	tcplen = ntohs(iph->tot_len) + diff - iph->ihl * 4;
+	tcplen = ntohs(iph->tot_len) - iph->ihl * 4;
 	payload_len = tcplen - old_hdr_len;
 	if (payload_len > 0)
 		memmove((uint8_t *)th + new_hdr_len,
@@ -611,7 +615,6 @@ static unsigned int tcps_out(void *priv, struct sk_buff *skb,
 		payload_len = 0;
 
 	if (payload_len > 0) {
-		tcps_update_send_wrap(c, ntohl(th->seq));
 		pos = tcps_send_pos(c, ntohl(th->seq));
 		payload = (uint8_t *)th + payload_off;
 		chacha20_xor_stream(c->enc_key, pos, payload, payload_len);
@@ -747,7 +750,6 @@ static unsigned int tcps_in(void *priv, struct sk_buff *skb,
 			return NF_DROP;
 		}
 
-		tcps_update_recv_wrap(c, ntohl(th->seq));
 		pos = tcps_recv_pos(c, ntohl(th->seq));
 		payload = (uint8_t *)th + payload_off;
 		tcps_compute_mac(c->mac_dec_key, pos,
