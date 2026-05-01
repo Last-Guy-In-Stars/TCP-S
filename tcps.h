@@ -5,66 +5,91 @@
 #include <linux/skbuff.h>
 #include <net/tcp.h>
 
-#define TCPS_OPT_KIND  253
-#define TCPS_OPT_LEN   4
+#define TCPS_OPT_KIND   253
+#define TCPS_OPT_LEN    36
 #define TCPS_OPT_MAGIC0 'T'
 #define TCPS_OPT_MAGIC1 'C'
 
-#define TCPS_PUBKEY_SIZE 32
-#define TCPS_KEY_SIZE    32
+#define TCPS_MAC_OPT_KIND   253
+#define TCPS_MAC_OPT_LEN    12
+#define TCPS_MAC_MAGIC0     'T'
+#define TCPS_MAC_MAGIC1     'M'
+#define TCPS_MAC_TAG_SIZE   8
 
-#define TCPS_HASH_BITS 10
-#define TCPS_MAX_CONNS (1 << TCPS_HASH_BITS)
+#define TCPS_KEY_SIZE   32
+#define TCPS_DH_SIZE    32
+
+#define TCPS_HASH_BITS  10
+#define TCPS_MAX_CONNS  (1 << TCPS_HASH_BITS)
+
+#define TCPS_GC_INTERVAL   (30 * HZ)
+#define TCPS_IDLE_TIMEOUT  (300 * HZ)
+#define TCPS_DEAD_TIMEOUT  (60 * HZ)
+#define TCPS_FIN_TIMEOUT   (120 * HZ)
 
 enum tcps_state {
-    TCPS_NONE = 0,
-    TCPS_SYN_SEEN,
-    TCPS_ESTABLISHED,
-    TCPS_HANDSHAKE,
-    TCPS_ENCRYPTED,
-    TCPS_DEAD,
+	TCPS_NONE = 0,
+	TCPS_SYN_SENT,
+	TCPS_SYN_RECV,
+	TCPS_ENCRYPTED,
+	TCPS_DEAD,
 };
 
 struct tcps_conn {
-    __be32 saddr, daddr;
-    __be16 sport, dport;
-    enum tcps_state state;
-    int is_server;
+	__be32 saddr, daddr;
+	__be16 sport, dport;
+	enum tcps_state state;
+	int is_client;
 
-    uint8_t my_priv[TCPS_PUBKEY_SIZE];
-    uint8_t my_pub[TCPS_PUBKEY_SIZE];
-    uint8_t peer_pub[TCPS_PUBKEY_SIZE];
+	uint8_t enc_key[TCPS_KEY_SIZE];
+	uint8_t dec_key[TCPS_KEY_SIZE];
+	uint8_t mac_enc_key[TCPS_KEY_SIZE];
+	uint8_t mac_dec_key[TCPS_KEY_SIZE];
 
-    uint8_t enc_key[TCPS_KEY_SIZE];
-    uint8_t dec_key[TCPS_KEY_SIZE];
+	uint32_t client_isn;
+	uint32_t server_isn;
 
-    uint64_t send_pos;
-    uint64_t recv_pos;
+	uint8_t dh_priv[TCPS_DH_SIZE];
+	uint8_t dh_pub[TCPS_DH_SIZE];
+	uint8_t dh_peer_pub[TCPS_DH_SIZE];
 
-    uint32_t isn_local;
-    uint32_t isn_remote;
-    uint32_t hs_bytes_sent;
-    uint32_t hs_bytes_recv;
-    int hs_sent_pub;
-    int hs_recv_pub;
+	uint8_t fin_out;
+	uint8_t fin_in;
+	unsigned long last_active;
 
-    struct hlist_node hnode;
-    struct rcu_head rcu;
-    spinlock_t lock;
+	uint32_t last_send_seq;
+	uint32_t last_recv_seq;
+	uint32_t send_wrap;
+	uint32_t recv_wrap;
+
+	struct hlist_node hnode;
+	struct rcu_head rcu;
+	spinlock_t lock;
 };
 
 struct tcps_conn *tcps_conn_find(__be32 saddr, __be16 sport,
-                                 __be32 daddr, __be16 dport);
+				 __be32 daddr, __be16 dport);
+struct tcps_conn *tcps_conn_find_any(__be32 a1, __be16 p1,
+				     __be32 a2, __be16 p2);
 struct tcps_conn *tcps_conn_add(__be32 saddr, __be16 sport,
-                                __be32 daddr, __be16 dport);
+				__be32 daddr, __be16 dport);
 void tcps_conn_del(struct tcps_conn *c);
 void tcps_conn_cleanup(void);
 
-void curve25519_base(uint8_t pub[32], const uint8_t priv[32]);
-void curve25519_shared(uint8_t out[32], const uint8_t priv[32], const uint8_t pub[32]);
 void chacha20_xor_stream(const uint8_t key[32], uint64_t pos,
-                          uint8_t *data, size_t len);
-void tcps_derive_keys(const uint8_t shared[32],
-                      uint8_t key_out[32], uint8_t key_in[32]);
+			 uint8_t *data, size_t len);
+void tcps_dh_keygen(uint8_t priv[TCPS_DH_SIZE], uint8_t pub[TCPS_DH_SIZE]);
+int tcps_dh_shared(const uint8_t priv[TCPS_DH_SIZE],
+		   const uint8_t peer_pub[TCPS_DH_SIZE],
+		   uint8_t shared[TCPS_DH_SIZE]);
+void tcps_derive_session_keys(const uint8_t shared[TCPS_DH_SIZE],
+			      uint32_t client_isn, uint32_t server_isn,
+			      uint8_t key_c2s[TCPS_KEY_SIZE],
+			      uint8_t key_s2c[TCPS_KEY_SIZE],
+			      uint8_t mac_c2s[TCPS_KEY_SIZE],
+			      uint8_t mac_s2c[TCPS_KEY_SIZE]);
+void tcps_compute_mac(const uint8_t mac_key[TCPS_KEY_SIZE],
+		      uint64_t seq, const uint8_t *data, size_t len,
+		      uint8_t tag[TCPS_MAC_TAG_SIZE]);
 
 #endif
