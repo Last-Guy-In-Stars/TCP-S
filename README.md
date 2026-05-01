@@ -48,3 +48,5 @@ sudo insmod tcps.ko     # загружаем модуль в ядро <br>
 ```
 # Любое TCP-подключение между этими машинами автоматически шифруется. PostgreSQL, HTTP, SSH — что угодно.
 Модуль сидит в netfilter (L4), а не на порту. Он видит каждый TCP-пакет, проходящий через ядро.
+---
+License — MIT. Use it, fork it, bypass censorship responsibly.
