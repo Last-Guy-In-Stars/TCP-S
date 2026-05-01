@@ -20,7 +20,6 @@
 #define TCPS_DH_SIZE    32
 
 #define TCPS_HASH_BITS  10
-#define TCPS_MAX_CONNS  (1 << TCPS_HASH_BITS)
 
 #define TCPS_GC_INTERVAL   (30 * HZ)
 #define TCPS_IDLE_TIMEOUT  (300 * HZ)
@@ -67,13 +66,10 @@ struct tcps_conn {
 	spinlock_t lock;
 };
 
-struct tcps_conn *tcps_conn_find(__be32 saddr, __be16 sport,
-				 __be32 daddr, __be16 dport);
 struct tcps_conn *tcps_conn_find_any(__be32 a1, __be16 p1,
 				     __be32 a2, __be16 p2);
 struct tcps_conn *tcps_conn_add(__be32 saddr, __be16 sport,
 				__be32 daddr, __be16 dport);
-void tcps_conn_del(struct tcps_conn *c);
 void tcps_conn_cleanup(void);
 
 void chacha20_xor_stream(const uint8_t key[32], uint64_t pos,

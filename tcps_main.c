@@ -73,21 +73,6 @@ static inline void tcps_update_recv_wrap(struct tcps_conn *c, uint32_t seq)
 	c->last_recv_seq = seq;
 }
 
-struct tcps_conn *tcps_conn_find(__be32 saddr, __be16 sport,
-				 __be32 daddr, __be16 dport)
-{
-	uint32_t h;
-	struct tcps_conn *c;
-
-	h = tcps_hash4(saddr, sport, daddr, dport);
-	hash_for_each_possible_rcu(tcps_table, c, hnode, h) {
-		if (c->saddr == saddr && c->daddr == daddr &&
-		    c->sport == sport && c->dport == dport)
-			return c;
-	}
-	return NULL;
-}
-
 struct tcps_conn *tcps_conn_find_any(__be32 a1, __be16 p1,
 				     __be32 a2, __be16 p2)
 {
@@ -155,14 +140,6 @@ static void tcps_conn_free_rcu(struct rcu_head *head)
 	memzero_explicit(c->mac_enc_key, sizeof(c->mac_enc_key));
 	memzero_explicit(c->mac_dec_key, sizeof(c->mac_dec_key));
 	kfree(c);
-}
-
-void tcps_conn_del(struct tcps_conn *c)
-{
-	spin_lock(&tcps_lock);
-	hash_del_rcu(&c->hnode);
-	spin_unlock(&tcps_lock);
-	call_rcu(&c->rcu, tcps_conn_free_rcu);
 }
 
 void tcps_conn_cleanup(void)
@@ -561,7 +538,6 @@ static unsigned int tcps_out(void *priv, struct sk_buff *skb,
 		if (c) {
 			spin_lock(&c->lock);
 			if (c->state != TCPS_NONE && c->state != TCPS_SYN_SENT) {
-				pr_debug("tcps: SYN out state=%d, skip\n", c->state);
 				spin_unlock(&c->lock);
 				rcu_read_unlock();
 				return NF_ACCEPT;
@@ -575,15 +551,8 @@ static unsigned int tcps_out(void *priv, struct sk_buff *skb,
 					&iph->saddr, ntohs(th->source),
 					&iph->daddr, ntohs(th->dest));
 				c->state = TCPS_DEAD;
-			} else {
-				pr_info("tcps: SYN out %pI4:%u->%pI4:%u isn=%u\n",
-					&iph->saddr, ntohs(th->source),
-					&iph->daddr, ntohs(th->dest),
-					c->client_isn);
 			}
 			spin_unlock(&c->lock);
-		} else {
-			pr_debug("tcps: SYN out conn_add failed\n");
 		}
 		rcu_read_unlock();
 		return NF_ACCEPT;
@@ -606,10 +575,6 @@ static unsigned int tcps_out(void *priv, struct sk_buff *skb,
 			c->server_isn = ntohl(th->seq);
 			c->last_active = jiffies;
 			tcps_conn_derive(c);
-			pr_info("tcps: SYN+ACK out %pI4:%u->%pI4:%u isn=%u\n",
-				&iph->saddr, ntohs(th->source),
-				&iph->daddr, ntohs(th->dest),
-				c->server_isn);
 			spin_unlock(&c->lock);
 		}
 		rcu_read_unlock();
@@ -685,6 +650,7 @@ static unsigned int tcps_in(void *priv, struct sk_buff *skb,
 	uint8_t peer_pub[TCPS_DH_SIZE];
 	uint8_t recv_tag[TCPS_MAC_TAG_SIZE];
 	uint8_t calc_tag[TCPS_MAC_TAG_SIZE];
+
 	if (!skb || skb->protocol != htons(ETH_P_IP))
 		return NF_ACCEPT;
 	iph = ip_hdr(skb);
@@ -706,7 +672,6 @@ static unsigned int tcps_in(void *priv, struct sk_buff *skb,
 				spin_lock(&c->lock);
 				if (c->state != TCPS_NONE &&
 				    c->state != TCPS_SYN_RECV) {
-					pr_debug("tcps: SYN in state=%d, skip\n", c->state);
 					spin_unlock(&c->lock);
 					rcu_read_unlock();
 					return NF_ACCEPT;
@@ -717,10 +682,6 @@ static unsigned int tcps_in(void *priv, struct sk_buff *skb,
 				memcpy(c->dh_peer_pub, peer_pub,
 				       TCPS_DH_SIZE);
 				c->state = TCPS_SYN_RECV;
-				pr_info("tcps: SYN in %pI4:%u->%pI4:%u isn=%u\n",
-					&iph->saddr, ntohs(th->source),
-					&iph->daddr, ntohs(th->dest),
-					c->client_isn);
 				spin_unlock(&c->lock);
 			}
 		}
@@ -739,11 +700,8 @@ static unsigned int tcps_in(void *priv, struct sk_buff *skb,
 				memcpy(c->dh_peer_pub, peer_pub,
 				       TCPS_DH_SIZE);
 				tcps_conn_derive(c);
-				pr_info("tcps: SYN+ACK in %pI4:%u->%pI4:%u derived\n",
-					&iph->saddr, ntohs(th->source),
-					&iph->daddr, ntohs(th->dest));
 			} else {
-				pr_warn("tcps: SYN+ACK in no TCPS option, dead\n");
+				pr_warn("tcps: SYN+ACK in without TCPS option\n");
 				c->state = TCPS_DEAD;
 			}
 			spin_unlock(&c->lock);
