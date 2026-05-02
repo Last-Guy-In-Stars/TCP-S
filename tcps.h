@@ -95,7 +95,8 @@ void tcps_derive_session_keys(const uint8_t shared[TCPS_DH_SIZE],
 			      uint8_t mac_c2s[TCPS_KEY_SIZE],
 			      uint8_t mac_s2c[TCPS_KEY_SIZE]);
 void tcps_compute_mac(const uint8_t mac_key[TCPS_KEY_SIZE],
-		      uint64_t seq, const uint8_t *data, size_t len,
+		      uint64_t seq, uint8_t tcp_flags,
+		      const uint8_t *data, size_t len,
 		      uint8_t tag[TCPS_MAC_TAG_SIZE]);
 
 struct tcps_peer_entry {

@@ -20,10 +20,10 @@ tcps/
 3. SYN-ACK тоже несёт TC option с эфемерным pubkey сервера — оба хоста получают чужой pubkey
 4. После handshake — ECDH (X25519) shared secret → HKDF-Expand (ChaCha20 PRF) → 4 ключа
 5. Все TCP-данные шифруются ChaCha20 (stream cipher, размер не меняется)
-6. Каждый пакет с данными содержит Poly1305 MAC (16 байт) в TCP option TM (kind=253, 20 байт)
-7. Poly1305 key уникален для каждого пакета (derived from position)
-8. Пакеты без MAC или с неверным MAC отбрасываются (NF_DROP)
-9. **После шифрования**: оба хоста обмениваются TI option (kind=253, 40 байт) — статический pubkey + auth_tag
+6. Каждый пакет с данными или FIN содержит Poly1305 MAC (16 байт) в TCP option TM (kind=253, 20 байт)
+7. Poly1305 key уникален для каждого пакета (derived from position). AAD включает TCP flags
+8. Пакеты без MAC или с неверным MAC отбрасываются (NF_DROP). FIN без MAC — тоже дроп
+9. **После шифрования**: TI option отправляется только на pure ACK (no payload, no FIN)
 10. TI option верифицируется через TOFU + auth_tag → состояние TCPS_AUTHENTICATED
 11. Работает для всех TCP-сокетов на системе, приложения ничего не знают
 
@@ -33,6 +33,7 @@ tcps/
 - ChaCha20 — stream cipher, XOR на позиции потока, без изменения размера пакетов
 - Poly1305 — AEAD MAC, собственная реализация на 26-битных лимбах
 - **Per-packet Poly1305 key** — уникальный ключ для каждого пакета (ChaCha20(mac_key, pos + seq))
+- **MAC AAD covers TCP flags** — предотвращает подмену FIN/flags без обнаружения
 - KDF — HKDF-Expand паттерн: каждый ключ выводится отдельно с уникальным лейблом
   - `TCPS enc_c2s` (position 0x8000000000000000)
   - `TCPS enc_s2c` (position 0x8000000000000040)
@@ -86,8 +87,10 @@ echo 1 > /sys/module/tcps/parameters/enforce
 
 # Защита от downgrade и RST injection
 
-**Downgrade-атака** (strip TCPS options): при `enforce=1` SYN+ACK без TCPS option
-дропается — соединение не устанавливается в plaintext. Без `enforce` — fallback к обычному TCP.
+**Downgrade-атака** (strip TCPS options): при `enforce=1`:
+- Клиент: SYN+ACK без TCPS option дропается
+- Сервер: SYN без TCPS option дропается
+Без `enforce` — fallback к обычному TCP.
 
 **RST injection**: inbound RST пакеты в зашифрованном состоянии (ENCRYPTED/AUTHENTICATED)
 дропаются. Spoofed RST не может разорвать зашифрованную сессию. Соединение закрывается
@@ -195,16 +198,18 @@ tcpdump -i ens18 -A -s0 tcp
 | `unknown-253` в данных | TM option с Poly1305 тегом (20 байт, magic 'T','M') |
 | Нечитаемые данные | Payload зашифрован ChaCha20 |
 
+```
 
 # Свойства безопасности
 
 | Свойство | Механизм |
 |----------|----------|
 | Шифрование | ChaCha20 stream cipher |
-| Целостность | Poly1305 MAC (16 байт, per-packet key) |
+| Целостность | Poly1305 MAC (16 байт, per-packet key, AAD covers TCP flags) |
+| FIN injection | FIN пакеты требуют MAC, spoofed FIN отбрасывается |
 | Forward secrecy | Эфемерные X25519 DH-ключи, уничтожаются после деривации |
 | MITM-защита | TOFU + auth_tag (статический identity ключ) |
-| Downgrade-защита | Параметр `enforce=1` — дропать non-TCPS соединения |
+| Downgrade-защита | Параметр `enforce=1` — дропать non-TCPS соединения (client + server side) |
 | RST injection | Inbound RST дропается в зашифрованном состоянии |
 | Timing-атаки | crypto_memneq для MAC и auth_tag |
 | Key separation | HKDF-Expand с уникальными лейблами для каждого ключа |
@@ -216,7 +221,10 @@ tcpdump -i ens18 -A -s0 tcp
 |-------------|----------|
 | TOFU first-use | Первое соединение не аутентифицировано (как SSH). Сверяйте fingerprint |
 | IPv4 only | IPv6 пока не поддерживается |
-| auth_tag 4 байта | 32-bit security для identity verification. Увеличение потребует пересмотра TI option |
-| Нет лимита соединений | Возможен DoS через SYN flood с TCPS options (CPU: X25519 keygen) |
+| auth_tag 4 байта | 32-bit security для identity verification. Увеличение требует пересмотра TI option (40B — максимум TCP options) |
+| Нет лимита соединений | Лимит 4096 (tcps_conn_count). При превышении — SYN дропается |
+| TOFU kzalloc fail | Соединение отклоняется вместо доверия (return -1) |
+| TI ретранслируется | TI отправляется на каждом pure ACK пока не получен TI от пира (ti_recv) |
 | RST delay | Легитимный RST от пира дропается, закрытие через FIN/timeout |
+| Pure ACK не аутентифицирован | ACK без FIN и без payload не содержат MAC (overhead). FIN защищён |
 | TOFU cache in-memory | Теряется при rmmod, ключи на диск не сохраняются |

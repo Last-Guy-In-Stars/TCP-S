@@ -9,6 +9,7 @@
 #include <linux/slab.h>
 #include <linux/jhash.h>
 #include <linux/workqueue.h>
+#include <linux/atomic.h>
 #include <net/checksum.h>
 #include <crypto/algapi.h>
 #include "tcps.h"
@@ -33,6 +34,10 @@ MODULE_PARM_DESC(tofu_enforce, "TOFU enforcement: 0=off, 1=drop on key mismatch 
 static int tcps_enforce;
 module_param_named(enforce, tcps_enforce, int, 0644);
 MODULE_PARM_DESC(enforce, "Enforce encryption: 0=allow plaintext fallback, 1=drop non-TCPS connections (default: 0)");
+
+#define TCPS_MAX_CONN 4096
+
+static atomic_t tcps_conn_count = ATOMIC_INIT(0);
 
 static void tcps_gc(struct work_struct *work);
 static DECLARE_DELAYED_WORK(tcps_gc_work, tcps_gc);
@@ -116,6 +121,16 @@ struct tcps_conn *tcps_conn_add(__be32 saddr, __be16 sport,
 {
 	struct tcps_conn *c;
 	uint32_t h;
+	uint8_t dh_priv[TCPS_DH_SIZE];
+	uint8_t dh_pub[TCPS_DH_SIZE];
+
+	tcps_dh_keygen(dh_priv, dh_pub);
+
+	if (atomic_read(&tcps_conn_count) >= TCPS_MAX_CONN) {
+		memzero_explicit(dh_priv, sizeof(dh_priv));
+		memzero_explicit(dh_pub, sizeof(dh_pub));
+		return NULL;
+	}
 
 	h = tcps_hash4(saddr, sport, daddr, dport);
 	spin_lock(&tcps_lock);
@@ -126,16 +141,21 @@ struct tcps_conn *tcps_conn_add(__be32 saddr, __be16 sport,
 		     c->sport == dport && c->dport == sport)) {
 			if (c->state == TCPS_DEAD) {
 				hash_del_rcu(&c->hnode);
+				atomic_dec(&tcps_conn_count);
 				call_rcu(&c->rcu, tcps_conn_free_rcu);
 				break;
 			}
 			spin_unlock(&tcps_lock);
+			memzero_explicit(dh_priv, sizeof(dh_priv));
+			memzero_explicit(dh_pub, sizeof(dh_pub));
 			return c;
 		}
 	}
 	c = kzalloc(sizeof(*c), GFP_ATOMIC);
 	if (!c) {
 		spin_unlock(&tcps_lock);
+		memzero_explicit(dh_priv, sizeof(dh_priv));
+		memzero_explicit(dh_pub, sizeof(dh_pub));
 		return NULL;
 	}
 	c->saddr = saddr;
@@ -144,7 +164,11 @@ struct tcps_conn *tcps_conn_add(__be32 saddr, __be16 sport,
 	c->dport = dport;
 	c->last_active = jiffies;
 	spin_lock_init(&c->lock);
-	tcps_dh_keygen(c->dh_priv, c->dh_pub);
+	memcpy(c->dh_priv, dh_priv, TCPS_DH_SIZE);
+	memcpy(c->dh_pub, dh_pub, TCPS_DH_SIZE);
+	memzero_explicit(dh_priv, sizeof(dh_priv));
+	memzero_explicit(dh_pub, sizeof(dh_pub));
+	atomic_inc(&tcps_conn_count);
 	hash_add_rcu(tcps_table, &c->hnode, h);
 	spin_unlock(&tcps_lock);
 	return c;
@@ -170,6 +194,7 @@ void tcps_conn_cleanup(void)
 	unsigned bkt;
 	hash_for_each_safe(tcps_table, bkt, tmp, c, hnode) {
 		hash_del(&c->hnode);
+		atomic_dec(&tcps_conn_count);
 		memzero_explicit(c->dh_priv, sizeof(c->dh_priv));
 		memzero_explicit(c->dh_pub, sizeof(c->dh_pub));
 		memzero_explicit(c->dh_peer_pub, sizeof(c->dh_peer_pub));
@@ -204,6 +229,7 @@ static void tcps_gc(struct work_struct *work)
 		spin_unlock(&c->lock);
 		if (del) {
 			hash_del_rcu(&c->hnode);
+			atomic_dec(&tcps_conn_count);
 			call_rcu(&c->rcu, tcps_conn_free_rcu);
 		}
 	}
@@ -272,7 +298,7 @@ int tcps_tofu_verify(__be32 addr, const uint8_t pubkey[TCPS_DH_SIZE],
 
 	new_p = kzalloc(sizeof(*new_p), GFP_ATOMIC);
 	if (!new_p)
-		return 0;
+		return -1;
 
 	new_p->addr = addr;
 	memcpy(new_p->pubkey, pubkey, TCPS_DH_SIZE);
@@ -287,12 +313,40 @@ int tcps_tofu_verify(__be32 addr, const uint8_t pubkey[TCPS_DH_SIZE],
 			spin_unlock(&tcps_peers_lock);
 			kfree(new_p);
 			mismatch = crypto_memneq(saved_pub, pubkey, TCPS_DH_SIZE);
-			memzero_explicit(saved_pub, sizeof(saved_pub));
 			if (mismatch) {
+				memzero_explicit(saved_pub, sizeof(saved_pub));
 				pr_warn("tcps: MITM detected! Static key mismatch for peer %pI4\n",
 					&addr);
 				return -1;
 			}
+
+			if (auth_tag) {
+				uint8_t shared[TCPS_DH_SIZE];
+				uint8_t expected[TCPS_AUTH_TAG_SIZE];
+
+				if (tcps_dh_shared(tcps_static_priv, saved_pub,
+						   shared) < 0) {
+					memzero_explicit(shared, sizeof(shared));
+					memzero_explicit(saved_pub, sizeof(saved_pub));
+					pr_warn("tcps: auth_tag DH failed for %pI4\n",
+						&addr);
+					return -1;
+				}
+				tcps_compute_auth_tag(shared, client_isn,
+						      server_isn, is_client,
+						      expected);
+				memzero_explicit(shared, sizeof(shared));
+				if (crypto_memneq(auth_tag, expected,
+						  TCPS_AUTH_TAG_SIZE)) {
+					memzero_explicit(expected, sizeof(expected));
+					memzero_explicit(saved_pub, sizeof(saved_pub));
+					pr_warn("tcps: MITM detected! auth_tag mismatch for peer %pI4\n",
+						&addr);
+					return -1;
+				}
+				memzero_explicit(expected, sizeof(expected));
+			}
+			memzero_explicit(saved_pub, sizeof(saved_pub));
 			return 1;
 		}
 	}
@@ -776,7 +830,7 @@ static unsigned int tcps_out(void *priv, struct sk_buff *skb,
 	if (tcps_skb_is_fragment(skb))
 		return NF_ACCEPT;
 	if (skb_ensure_writable(skb, skb->len))
-		return NF_ACCEPT;
+		return NF_DROP;
 	th = tcp_hdr(skb);
 
 	rcu_read_lock();
@@ -853,8 +907,14 @@ static unsigned int tcps_out(void *priv, struct sk_buff *skb,
 		return NF_ACCEPT;
 	}
 
-	if (c->state == TCPS_ENCRYPTED && !c->ti_sent &&
-	    !th->syn && !th->fin) {
+	tcplen = ntohs(iph->tot_len) - iph->ihl * 4;
+	payload_off = th->doff * 4;
+	payload_len = tcplen - payload_off;
+	if (payload_len < 0)
+		payload_len = 0;
+
+	if (c->state == TCPS_ENCRYPTED && !c->ti_recv &&
+	    !th->syn && !th->fin && payload_len == 0) {
 		uint8_t auth_tag[TCPS_AUTH_TAG_SIZE];
 		struct tcps_peer_entry *pe;
 		uint32_t ph = jhash_1word(
@@ -891,18 +951,19 @@ static unsigned int tcps_out(void *priv, struct sk_buff *skb,
 		th = tcp_hdr(skb);
 	}
 
-	tcplen = ntohs(iph->tot_len) - iph->ihl * 4;
-	payload_off = th->doff * 4;
-	payload_len = tcplen - payload_off;
-	if (payload_len < 0)
-		payload_len = 0;
+	if (payload_len > 0 || th->fin) {
+		uint8_t tcp_flags = ((uint8_t *)th)[13];
 
-	if (payload_len > 0) {
 		pos = tcps_send_pos(c, ntohl(th->seq));
-		payload = (uint8_t *)th + payload_off;
-		chacha20_xor_stream(c->enc_key, pos, payload, payload_len);
-		tcps_compute_mac(c->mac_enc_key, pos,
-				 payload, payload_len, tag);
+
+		if (payload_len > 0) {
+			payload = (uint8_t *)th + payload_off;
+			chacha20_xor_stream(c->enc_key, pos, payload, payload_len);
+		}
+
+		tcps_compute_mac(c->mac_enc_key, pos, tcp_flags,
+				 payload_len > 0 ? (uint8_t *)th + payload_off : NULL,
+				 payload_len, tag);
 		if (add_mac_option(skb, tag) < 0) {
 			pr_warn("tcps: failed to add MAC option, dropping\n");
 			spin_unlock(&c->lock);
@@ -947,7 +1008,7 @@ static unsigned int tcps_in(void *priv, struct sk_buff *skb,
 	if (tcps_skb_is_fragment(skb))
 		return NF_ACCEPT;
 	if (skb_ensure_writable(skb, skb->len))
-		return NF_ACCEPT;
+		return NF_DROP;
 	th = tcp_hdr(skb);
 
 	rcu_read_lock();
@@ -972,6 +1033,9 @@ static unsigned int tcps_in(void *priv, struct sk_buff *skb,
 				c->state = TCPS_SYN_RECV;
 				spin_unlock(&c->lock);
 			}
+		} else if (tcps_enforce) {
+			rcu_read_unlock();
+			return NF_DROP;
 		}
 		rcu_read_unlock();
 		return NF_ACCEPT;
@@ -1051,7 +1115,9 @@ static unsigned int tcps_in(void *priv, struct sk_buff *skb,
 	if (payload_len < 0)
 		payload_len = 0;
 
-	if (payload_len > 0) {
+	if (payload_len > 0 || th->fin) {
+		uint8_t tcp_flags = ((uint8_t *)th)[13];
+
 		if (!tcp_option_find_mac(th, recv_tag)) {
 			pr_warn("tcps: no MAC option, dropping\n");
 			spin_unlock(&c->lock);
@@ -1060,9 +1126,9 @@ static unsigned int tcps_in(void *priv, struct sk_buff *skb,
 		}
 
 		pos = tcps_recv_pos(c, ntohl(th->seq));
-		payload = (uint8_t *)th + payload_off;
-		tcps_compute_mac(c->mac_dec_key, pos,
-				 payload, payload_len, calc_tag);
+		tcps_compute_mac(c->mac_dec_key, pos, tcp_flags,
+				 payload_len > 0 ? (uint8_t *)th + payload_off : NULL,
+				 payload_len, calc_tag);
 
 		if (crypto_memneq(recv_tag, calc_tag, TCPS_MAC_TAG_SIZE)) {
 			pr_warn("tcps: MAC verification failed, dropping\n");
@@ -1071,12 +1137,15 @@ static unsigned int tcps_in(void *priv, struct sk_buff *skb,
 			return NF_DROP;
 		}
 
-		chacha20_xor_stream(c->dec_key, pos, payload, payload_len);
-		th->check = 0;
-		th->check = csum_tcpudp_magic(iph->saddr, iph->daddr,
-					      tcplen, IPPROTO_TCP,
-					      csum_partial(th, tcplen, 0));
-		skb->ip_summed = CHECKSUM_NONE;
+		if (payload_len > 0) {
+			payload = (uint8_t *)th + payload_off;
+			chacha20_xor_stream(c->dec_key, pos, payload, payload_len);
+			th->check = 0;
+			th->check = csum_tcpudp_magic(iph->saddr, iph->daddr,
+						      tcplen, IPPROTO_TCP,
+						      csum_partial(th, tcplen, 0));
+			skb->ip_summed = CHECKSUM_NONE;
+		}
 	}
 
 	if (th->fin) {

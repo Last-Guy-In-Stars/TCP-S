@@ -272,7 +272,8 @@ static void poly1305_finish(struct poly1305_ctx *ctx, uint8_t tag[16])
 }
 
 void tcps_compute_mac(const uint8_t mac_key[TCPS_KEY_SIZE],
-		      uint64_t seq, const uint8_t *data, size_t len,
+		      uint64_t seq, uint8_t tcp_flags,
+		      const uint8_t *data, size_t len,
 		      uint8_t tag[TCPS_MAC_TAG_SIZE])
 {
 	uint8_t poly_key[32];
@@ -290,7 +291,8 @@ void tcps_compute_mac(const uint8_t mac_key[TCPS_KEY_SIZE],
 
 	memset(aad, 0, 16);
 	store_le64(aad, seq);
-	aad[8] = 0x01;
+	aad[8] = tcp_flags;
+	aad[9] = 0x01;
 	poly1305_block(&ctx, aad, 0);
 
 	for (i = 0; i + 16 <= len; i += 16)
