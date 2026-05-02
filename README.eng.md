@@ -226,3 +226,5 @@ Module activity indicators:
 | RST delay | Legitimate RST from the peer is dropped, closed via FIN/timeout |
 | Pure ACK is not authenticated | ACKs without FIN and without payload do not contain a MAC (overhead). FIN is protected |
 | TOFU cache in-memory | Lost during rmmod, keys are not saved to disk |
+---
+License: MIT. Use, fork, modify, and experiment.

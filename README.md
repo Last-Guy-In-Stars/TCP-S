@@ -228,3 +228,5 @@ tcpdump -i ens18 -A -s0 tcp
 | RST delay | Легитимный RST от пира дропается, закрытие через FIN/timeout |
 | Pure ACK не аутентифицирован | ACK без FIN и без payload не содержат MAC (overhead). FIN защищён |
 | TOFU cache in-memory | Теряется при rmmod, ключи на диск не сохраняются |
+---
+Лицензия — MIT. Используйте, создавайте форки, меняйте, эксперементируйте.
