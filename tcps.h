@@ -11,10 +11,10 @@
 #define TCPS_OPT_MAGIC1 'C'
 
 #define TCPS_MAC_OPT_KIND   253
-#define TCPS_MAC_OPT_LEN    12
+#define TCPS_MAC_OPT_LEN    20
 #define TCPS_MAC_MAGIC0     'T'
 #define TCPS_MAC_MAGIC1     'M'
-#define TCPS_MAC_TAG_SIZE   8
+#define TCPS_MAC_TAG_SIZE   16
 
 #define TCPS_TI_OPT_KIND    253
 #define TCPS_TI_OPT_LEN     40

@@ -132,6 +132,31 @@ int tcps_dh_shared(const uint8_t priv[TCPS_DH_SIZE],
 	return 0;
 }
 
+static void tcps_kdf_expand(const uint8_t prk[TCPS_KEY_SIZE],
+			    uint64_t position,
+			    const char *label, uint8_t counter,
+			    uint32_t client_isn, uint32_t server_isn,
+			    uint8_t out[TCPS_KEY_SIZE])
+{
+	uint8_t input[64];
+
+	memset(input, 0, sizeof(input));
+	memcpy(input, label, strlen(label));
+	input[32] = (uint8_t)(client_isn >> 24);
+	input[33] = (uint8_t)(client_isn >> 16);
+	input[34] = (uint8_t)(client_isn >> 8);
+	input[35] = (uint8_t)(client_isn);
+	input[36] = (uint8_t)(server_isn >> 24);
+	input[37] = (uint8_t)(server_isn >> 16);
+	input[38] = (uint8_t)(server_isn >> 8);
+	input[39] = (uint8_t)(server_isn);
+	input[40] = counter;
+
+	chacha20_xor_stream(prk, position, input, 64);
+	memcpy(out, input, TCPS_KEY_SIZE);
+	memzero_explicit(input, sizeof(input));
+}
+
 void tcps_derive_session_keys(const uint8_t shared[TCPS_DH_SIZE],
 			      uint32_t client_isn, uint32_t server_isn,
 			      uint8_t key_c2s[TCPS_KEY_SIZE],
@@ -139,39 +164,14 @@ void tcps_derive_session_keys(const uint8_t shared[TCPS_DH_SIZE],
 			      uint8_t mac_c2s[TCPS_KEY_SIZE],
 			      uint8_t mac_s2c[TCPS_KEY_SIZE])
 {
-	uint8_t material[128];
-	uint64_t kdf_pos;
-
-	kdf_pos = ((uint64_t)1 << 63) |
-		  (((uint64_t)client_isn << 32) | server_isn);
-	kdf_pos &= ~63ULL;
-
-	memset(material, 0, 128);
-	material[0]  = (uint8_t)(client_isn >> 24);
-	material[1]  = (uint8_t)(client_isn >> 16);
-	material[2]  = (uint8_t)(client_isn >> 8);
-	material[3]  = (uint8_t)(client_isn);
-	material[4]  = (uint8_t)(server_isn >> 24);
-	material[5]  = (uint8_t)(server_isn >> 16);
-	material[6]  = (uint8_t)(server_isn >> 8);
-	material[7]  = (uint8_t)(server_isn);
-	material[8]  = 'T';
-	material[9]  = 'C';
-	material[10] = 'P';
-	material[11] = 'S';
-	material[12] = '-';
-	material[13] = 'K';
-	material[14] = 'D';
-	material[15] = 'F';
-
-	chacha20_xor_stream(shared, kdf_pos, material, 128);
-
-	memcpy(key_c2s, material, 32);
-	memcpy(key_s2c, material + 32, 32);
-	memcpy(mac_c2s, material + 64, 32);
-	memcpy(mac_s2c, material + 96, 32);
-
-	memzero_explicit(material, sizeof(material));
+	tcps_kdf_expand(shared, (1ULL << 63) | 0, "TCPS enc_c2s", 1,
+			client_isn, server_isn, key_c2s);
+	tcps_kdf_expand(shared, (1ULL << 63) | 64, "TCPS enc_s2c", 2,
+			client_isn, server_isn, key_s2c);
+	tcps_kdf_expand(shared, (1ULL << 63) | 128, "TCPS mac_c2s", 3,
+			client_isn, server_isn, mac_c2s);
+	tcps_kdf_expand(shared, (1ULL << 63) | 192, "TCPS mac_s2c", 4,
+			client_isn, server_isn, mac_s2c);
 }
 
 struct poly1305_ctx {
@@ -284,7 +284,7 @@ void tcps_compute_mac(const uint8_t mac_key[TCPS_KEY_SIZE],
 	size_t n;
 
 	memset(poly_key, 0, 32);
-	chacha20_xor_stream(mac_key, ((uint64_t)1 << 62), poly_key, 32);
+	chacha20_xor_stream(mac_key, ((uint64_t)1 << 62) + seq, poly_key, 32);
 
 	poly1305_init(&ctx, poly_key);
 

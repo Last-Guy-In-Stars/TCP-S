@@ -30,6 +30,10 @@ static int tcps_tofu_enforce = 1;
 module_param_named(tofu_enforce, tcps_tofu_enforce, int, 0644);
 MODULE_PARM_DESC(tofu_enforce, "TOFU enforcement: 0=off, 1=drop on key mismatch (default)");
 
+static int tcps_enforce;
+module_param_named(enforce, tcps_enforce, int, 0644);
+MODULE_PARM_DESC(enforce, "Enforce encryption: 0=allow plaintext fallback, 1=drop non-TCPS connections (default: 0)");
+
 static void tcps_gc(struct work_struct *work);
 static DECLARE_DELAYED_WORK(tcps_gc_work, tcps_gc);
 
@@ -218,21 +222,30 @@ int tcps_tofu_verify(__be32 addr, const uint8_t pubkey[TCPS_DH_SIZE],
 	rcu_read_lock();
 	hash_for_each_possible_rcu(tcps_peers_table, p, hnode, h) {
 		if (p->addr == addr) {
+			uint8_t saved_pub[TCPS_DH_SIZE];
+			int mismatch;
+
+			memcpy(saved_pub, p->pubkey, TCPS_DH_SIZE);
+			mismatch = crypto_memneq(saved_pub, pubkey, TCPS_DH_SIZE);
 			rcu_read_unlock();
-			if (crypto_memneq(p->pubkey, pubkey, TCPS_DH_SIZE)) {
+
+			if (mismatch) {
 				pr_warn("tcps: MITM detected! Static key mismatch for peer %pI4\n",
 					&addr);
 				pr_warn("tcps: expected %*phN, got %*phN\n",
-					8, p->pubkey, 8, pubkey);
+					8, saved_pub, 8, pubkey);
+				memzero_explicit(saved_pub, sizeof(saved_pub));
 				return -1;
 			}
-			if (auth_tag && memchr_inv(auth_tag, 0, TCPS_AUTH_TAG_SIZE)) {
+
+			if (auth_tag) {
 				uint8_t shared[TCPS_DH_SIZE];
 				uint8_t expected[TCPS_AUTH_TAG_SIZE];
 
-				if (tcps_dh_shared(tcps_static_priv, p->pubkey,
+				if (tcps_dh_shared(tcps_static_priv, saved_pub,
 						   shared) < 0) {
 					memzero_explicit(shared, sizeof(shared));
+					memzero_explicit(saved_pub, sizeof(saved_pub));
 					pr_warn("tcps: auth_tag DH failed for %pI4\n",
 						&addr);
 					return -1;
@@ -244,12 +257,14 @@ int tcps_tofu_verify(__be32 addr, const uint8_t pubkey[TCPS_DH_SIZE],
 				if (crypto_memneq(auth_tag, expected,
 						  TCPS_AUTH_TAG_SIZE)) {
 					memzero_explicit(expected, sizeof(expected));
+					memzero_explicit(saved_pub, sizeof(saved_pub));
 					pr_warn("tcps: MITM detected! auth_tag mismatch for peer %pI4\n",
 						&addr);
 					return -1;
 				}
 				memzero_explicit(expected, sizeof(expected));
 			}
+			memzero_explicit(saved_pub, sizeof(saved_pub));
 			return 1;
 		}
 	}
@@ -265,9 +280,15 @@ int tcps_tofu_verify(__be32 addr, const uint8_t pubkey[TCPS_DH_SIZE],
 	spin_lock(&tcps_peers_lock);
 	hash_for_each_possible(tcps_peers_table, p, hnode, h) {
 		if (p->addr == addr) {
+			uint8_t saved_pub[TCPS_DH_SIZE];
+			int mismatch;
+
+			memcpy(saved_pub, p->pubkey, TCPS_DH_SIZE);
 			spin_unlock(&tcps_peers_lock);
 			kfree(new_p);
-			if (crypto_memneq(p->pubkey, pubkey, TCPS_DH_SIZE)) {
+			mismatch = crypto_memneq(saved_pub, pubkey, TCPS_DH_SIZE);
+			memzero_explicit(saved_pub, sizeof(saved_pub));
+			if (mismatch) {
 				pr_warn("tcps: MITM detected! Static key mismatch for peer %pI4\n",
 					&addr);
 				return -1;
@@ -957,6 +978,7 @@ static unsigned int tcps_in(void *priv, struct sk_buff *skb,
 	}
 
 	if (th->syn && th->ack) {
+		int drop = 0;
 		c = tcps_conn_find_any(iph->saddr, th->source,
 				       iph->daddr, th->dest);
 		if (c && c->state == TCPS_SYN_SENT) {
@@ -970,11 +992,12 @@ static unsigned int tcps_in(void *priv, struct sk_buff *skb,
 			} else {
 				pr_warn("tcps: SYN+ACK in without TCPS option\n");
 				c->state = TCPS_DEAD;
+				drop = tcps_enforce;
 			}
 			spin_unlock(&c->lock);
 		}
 		rcu_read_unlock();
-		return NF_ACCEPT;
+		return drop ? NF_DROP : NF_ACCEPT;
 	}
 
 	c = tcps_conn_find_any(iph->saddr, th->source,
@@ -994,10 +1017,9 @@ static unsigned int tcps_in(void *priv, struct sk_buff *skb,
 	c->last_active = jiffies;
 
 	if (th->rst) {
-		c->state = TCPS_DEAD;
 		spin_unlock(&c->lock);
 		rcu_read_unlock();
-		return NF_ACCEPT;
+		return NF_DROP;
 	}
 
 	if (c->state == TCPS_ENCRYPTED && !c->ti_recv) {
