@@ -16,10 +16,17 @@
 #define TCPS_MAC_MAGIC1     'M'
 #define TCPS_MAC_TAG_SIZE   8
 
+#define TCPS_TI_OPT_KIND    253
+#define TCPS_TI_OPT_LEN     40
+#define TCPS_TI_MAGIC0      'T'
+#define TCPS_TI_MAGIC1      'I'
+#define TCPS_AUTH_TAG_SIZE  4
+
 #define TCPS_KEY_SIZE   32
 #define TCPS_DH_SIZE    32
 
 #define TCPS_HASH_BITS  10
+#define TCPS_PEER_HASH_BITS 8
 
 #define TCPS_GC_INTERVAL   (30 * HZ)
 #define TCPS_IDLE_TIMEOUT  (300 * HZ)
@@ -31,6 +38,7 @@ enum tcps_state {
 	TCPS_SYN_SENT,
 	TCPS_SYN_RECV,
 	TCPS_ENCRYPTED,
+	TCPS_AUTHENTICATED,
 	TCPS_DEAD,
 };
 
@@ -54,6 +62,8 @@ struct tcps_conn {
 
 	uint8_t fin_out;
 	uint8_t fin_in;
+	uint8_t ti_sent;
+	uint8_t ti_recv;
 	unsigned long last_active;
 
 	uint32_t send_wrap;
@@ -87,5 +97,18 @@ void tcps_derive_session_keys(const uint8_t shared[TCPS_DH_SIZE],
 void tcps_compute_mac(const uint8_t mac_key[TCPS_KEY_SIZE],
 		      uint64_t seq, const uint8_t *data, size_t len,
 		      uint8_t tag[TCPS_MAC_TAG_SIZE]);
+
+struct tcps_peer_entry {
+	__be32 addr;
+	uint8_t pubkey[TCPS_DH_SIZE];
+	struct hlist_node hnode;
+	struct rcu_head rcu;
+};
+
+int tcps_tofu_verify(__be32 addr, const uint8_t pubkey[TCPS_DH_SIZE],
+		     const uint8_t auth_tag[TCPS_AUTH_TAG_SIZE],
+		     uint32_t client_isn, uint32_t server_isn,
+		     int is_client);
+void tcps_tofu_cleanup(void);
 
 #endif
