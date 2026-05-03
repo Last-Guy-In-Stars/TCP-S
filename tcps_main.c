@@ -14,8 +14,8 @@
 #include <crypto/algapi.h>
 #include "tcps.h"
 
-MODULE_LICENSE("GPL");
-MODULE_AUTHOR("tcps");
+MODULE_LICENSE("MIT");
+MODULE_AUTHOR("ArtamonovKA - tcps");
 MODULE_DESCRIPTION("Transparent TCP encryption: ECDH + ChaCha20-Poly1305 + TOFU/MITM protection + forward secrecy");
 MODULE_SOFTDEP("pre: libcurve25519");
 
