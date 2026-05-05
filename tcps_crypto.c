@@ -276,6 +276,15 @@ void tcps_compute_mac(const uint8_t mac_key[TCPS_KEY_SIZE],
 		      const uint8_t *data, size_t len,
 		      uint8_t tag[TCPS_MAC_TAG_SIZE])
 {
+	tcps_compute_mac_prefix(mac_key, seq, tcp_flags, NULL, 0, data, len, tag);
+}
+
+void tcps_compute_mac_prefix(const uint8_t mac_key[TCPS_KEY_SIZE],
+			     uint64_t seq, uint8_t tcp_flags,
+			     const uint8_t *prefix, size_t prefix_len,
+			     const uint8_t *data, size_t data_len,
+			     uint8_t tag[TCPS_MAC_TAG_SIZE])
+{
 	uint8_t poly_key[32];
 	uint8_t full_tag[16];
 	uint8_t aad[16];
@@ -283,6 +292,7 @@ void tcps_compute_mac(const uint8_t mac_key[TCPS_KEY_SIZE],
 	struct poly1305_ctx ctx;
 	size_t i;
 	size_t n;
+	size_t total_len = prefix_len + data_len;
 
 	memset(poly_key, 0, 32);
 	chacha20_xor_stream(mac_key, ((uint64_t)1 << 62) + seq, poly_key, 32);
@@ -295,10 +305,23 @@ void tcps_compute_mac(const uint8_t mac_key[TCPS_KEY_SIZE],
 	aad[9] = 0x01;
 	poly1305_block(&ctx, aad, 0);
 
-	for (i = 0; i + 16 <= len; i += 16)
+	if (prefix && prefix_len > 0) {
+		for (i = 0; i + 16 <= prefix_len; i += 16)
+			poly1305_block(&ctx, prefix + i, 1);
+
+		n = prefix_len - i;
+		if (n > 0) {
+			memset(pad, 0, 16);
+			memcpy(pad, prefix + i, n);
+			pad[n] = 0x01;
+			poly1305_block(&ctx, pad, 0);
+		}
+	}
+
+	for (i = 0; i + 16 <= data_len; i += 16)
 		poly1305_block(&ctx, data + i, 1);
 
-	n = len - i;
+	n = data_len - i;
 	if (n > 0) {
 		memset(pad, 0, 16);
 		memcpy(pad, data + i, n);
@@ -308,7 +331,7 @@ void tcps_compute_mac(const uint8_t mac_key[TCPS_KEY_SIZE],
 
 	memset(pad, 0, 16);
 	store_le64(pad, 8);
-	store_le64(pad + 8, len);
+	store_le64(pad + 8, total_len);
 	poly1305_block(&ctx, pad, 1);
 
 	poly1305_finish(&ctx, full_tag);

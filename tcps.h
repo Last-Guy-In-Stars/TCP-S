@@ -6,9 +6,10 @@
 #include <net/tcp.h>
 
 #define TCPS_OPT_KIND   253
-#define TCPS_OPT_LEN    36
+#define TCPS_OPT_LEN    40
 #define TCPS_OPT_MAGIC0 'T'
 #define TCPS_OPT_MAGIC1 'C'
+#define TCPS_OPT_EPOCH_SIZE 4
 
 #define TCPS_MAC_OPT_KIND   253
 #define TCPS_MAC_OPT_LEN    20
@@ -22,6 +23,17 @@
 #define TCPS_TI_MAGIC1      'I'
 #define TCPS_AUTH_TAG_SIZE  4
 
+#define TCPS_TI_EMBED_MARKER 0x01
+#define TCPS_TI_EMBED_SIZE   (1 + TCPS_DH_SIZE + TCPS_AUTH_TAG_SIZE)
+
+#define TCPS_PROBE_REQ_MARKER  0x02
+#define TCPS_PROBE_RSP_MARKER  0x03
+#define TCPS_PROBE_MAGIC1      'T'
+#define TCPS_PROBE_MAGIC2      'P'
+#define TCPS_PROBE_REQ_MAGIC3  'R'
+#define TCPS_PROBE_RSP_MAGIC3  'S'
+#define TCPS_PROBE_SIZE        (4 + TCPS_DH_SIZE)
+
 #define TCPS_KEY_SIZE   32
 #define TCPS_DH_SIZE    32
 
@@ -32,6 +44,8 @@
 #define TCPS_IDLE_TIMEOUT  (300 * HZ)
 #define TCPS_DEAD_TIMEOUT  (60 * HZ)
 #define TCPS_FIN_TIMEOUT   (120 * HZ)
+#define TCPS_TI_TIMEOUT    (30 * HZ)
+#define TCPS_PROBE_TIMEOUT (30 * HZ)
 
 enum tcps_state {
 	TCPS_NONE = 0,
@@ -39,6 +53,7 @@ enum tcps_state {
 	TCPS_SYN_RECV,
 	TCPS_ENCRYPTED,
 	TCPS_AUTHENTICATED,
+	TCPS_PLAIN_PROBE,
 	TCPS_DEAD,
 };
 
@@ -64,6 +79,10 @@ struct tcps_conn {
 	uint8_t fin_in;
 	uint8_t ti_sent;
 	uint8_t ti_recv;
+	uint8_t probe_sent;
+	uint8_t probe_recv;
+	uint8_t kill;
+	uint32_t peer_epoch;
 	unsigned long last_active;
 
 	uint32_t send_wrap;
@@ -98,10 +117,16 @@ void tcps_compute_mac(const uint8_t mac_key[TCPS_KEY_SIZE],
 		      uint64_t seq, uint8_t tcp_flags,
 		      const uint8_t *data, size_t len,
 		      uint8_t tag[TCPS_MAC_TAG_SIZE]);
+void tcps_compute_mac_prefix(const uint8_t mac_key[TCPS_KEY_SIZE],
+			     uint64_t seq, uint8_t tcp_flags,
+			     const uint8_t *prefix, size_t prefix_len,
+			     const uint8_t *data, size_t data_len,
+			     uint8_t tag[TCPS_MAC_TAG_SIZE]);
 
 struct tcps_peer_entry {
 	__be32 addr;
 	uint8_t pubkey[TCPS_DH_SIZE];
+	uint32_t epoch;
 	struct hlist_node hnode;
 	struct rcu_head rcu;
 };
@@ -109,7 +134,7 @@ struct tcps_peer_entry {
 int tcps_tofu_verify(__be32 addr, const uint8_t pubkey[TCPS_DH_SIZE],
 		     const uint8_t auth_tag[TCPS_AUTH_TAG_SIZE],
 		     uint32_t client_isn, uint32_t server_isn,
-		     int is_client);
+		     int is_client, uint32_t peer_epoch);
 void tcps_tofu_cleanup(void);
 
 #endif
