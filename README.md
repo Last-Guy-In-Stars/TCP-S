@@ -4,7 +4,7 @@
 ```
 tcps/
 ├── kernel/ # Linux kernel module (LKM)
-│ ├── tcps.h # Header: states, constants AEAD, TOFU, TI option, epoch, embedded TI, probe
+│ ├── tcps.h # Header: states, AEAD constants, TOFU, embedded TI, probe, epoch
 │ ├── tcps_main.c # Netfilter hooks, options, MAC, TOFU + forward secrecy + epoch rotation + auto-discovery + in-band probe
 │ ├── tcps_crypto.c # X25519 + ChaCha20 + Poly1305 + mac_prefix for the kernel
 │ ├── Makefile # Build: make → tcps.ko
@@ -22,23 +22,24 @@ tcps/
 5. All TCP data is encrypted with ChaCha20 (stream cipher, size unchanged).
 6. Each data or FIN packet contains a Poly1305 MAC (16 bytes) in TCP option TM (kind=253, 20 bytes).
 7. The Poly1305 key is unique for each packet (derived from position). The AAD includes TCP flags.
-8. Packets without a MAC or with an invalid MAC are discarded (NF_DROP). FIN without MAC is also a drop.
-9. **TI delivery** — two mechanisms:
-- **TI option** (kind=253, 40 bytes) — on pure ACK (no payload, no FIN)
-- **Embedded TI** (37 bytes in payload) — on the first data packet, if a pure ACK has not yet been sent.
-10. TI option/embedded TI is verified via TOFU + auth_tag → TCPS_AUTHENTICATED state.
-11. Works for all TCP sockets on the system; applications are unaware of this.
+8. Packets without a MAC or with an invalid MAC are discarded (NF_DROP). FIN without MAC is also a drop
+9. **TI delivery** — only **embedded TI** (49 bytes in the payload of the first data packet)
+- TI option (52 bytes) does not fit in the TCP options (maximum 40 bytes) — path removed
+10. Embedded TI is verified via TOFU + auth_tag → TCPS_AUTHENTICATED state
+11. Embedded TI is sent in the ENCRYPTED **or** AUTHENTICATED state (if `ti_sent == 0`)
+- This is necessary for request-response protocols (HTTP, SQL, Redis), where the server receives the client's TI before sending the data itself
+12. Works for all TCP sockets on the system; applications are unaware of this.
 
 # TCPS Peer Autodiscovery
 
-The TOFU cache doubles as an automatic TCPS peer list — no manual configuration required.
+The TOFU cache doubles as an **automatic TCPS peer list** — no manual configuration required.
 
 **How ​​it works:**
 - The module always adds the TC option to the outgoing SYN (try TCPS)
 - If SYN+ACK arrived with the TC option → the peer has the module → TCPS session → the IP is added to TOFU
 - If SYN+ACK arrived without the TC option → we check TOFU:
 - Peer is in TOFU → downgrade attack! → NF_DROP
-- Peer is not in TOFU → enable in-band probe (see below)
+- Peer is not in TOFU → plain TCP (the peer doesn't have the module)
 
 **Result:** `apt-get update`, DNS, HTTP to external servers – everything works.
 As soon as both sides have the module and have connected at least once, downgrade is automatically blocked.
@@ -49,21 +50,26 @@ As soon as both sides have the module and have connected at least once, downgrad
 | SYN without TC (server) | No + enforce=0 | NF_ACCEPT — plain TCP |
 | SYN without TC (server) | No + enforce=1 | NF_DROP — strict mode |
 | SYN+ACK without TC (client) | Yes | NF_DROP — downgrade |
-| SYN+ACK without TC (client) | No | PLAIN_PROBE → in-band probe |
+| SYN+ACK without TC (client) | No | PLAIN_PROBE → plain TCP |
 
 If `enforce=1` on the server, even unknown clients must have the module.
 If `enforce=0` (default), unknown clients can connect via plain TCP.
 
-# In-band probe — automatic downgrade detection on first connection
+# In-band probe — downgrade detection (server side)
 
-Problem: When connecting to a new peer for the first time, a MITM can strip the TCP option from SYN+ACK.
+Problem: When first connecting to a new peer, a MITM attack can strip the TC option from SYN+ACK.
 The client thinks the module isn't present and falls back to plain TCP. This is a classic SSH first-use vector.
 
-**Solution: in-band probe via payload.** A MITM can easily strip TCP options (header),
-but modifying the payload is much more difficult—you need to monitor the TCP stream and adjust the seq/length/checksum.
-Most MITM tools (arpspoof, ettercap) don't modify the payload.
+**Solution:** The server side in-band probe is retained for compatibility with clients
+using an older version of the module (which sends a probe in the payload). The server accepts the probe request, sends a probe response → the client detects a downgrade.
 
-**Protocol:**
+**The current version** doesn't insert a probe into the client's payload (this broke HTTP and other protocols —
+36 extra bytes + TCP sequence number desynchronization). Instead:
+
+- If SYN+ACK without TC from an unknown peer → plain TCP (data is not modified)
+- If the server receives data without MAC in ENCRYPTED → NF_DROP (MITM is blocked)
+
+**Probe protocol (for compatibility with older clients):**
 
 ```
 Probe request (client → server):
@@ -73,102 +79,113 @@ Probe response (server → client):
 [0x03]['T']['P']['S'][static_pub(32)] = 36 bytes at the beginning of the first response
 ```
 
-**Flow during MITM (strip TC option):**
+**Stream with MITM (strip TC option) — old client + current server:**
 
-1. SYN+ACK without TC → conn enters `TCPS_PLAIN_PROBE` state (instead of DEAD)
-2. Client: first data packet → prepend probe request → `probe_sent=1`
-3. Server: sees `0x02+'TPR'` marker in the payload → strip probe → creates conn (PLAIN_PROBE) →
+1. SYN+ACK without TC → conn enters state `TCPS_PLAIN_PROBE`
+2. Old client: first data packet → prepend probe request → `probe_sent=1`
+3. Server: sees marker `0x02+'TPR'` in payload → strip probe → creates conn (PLAIN_PROBE) →
 adds client to TOFU → logs warning
 4. Server: first data response → prepend probe response → `probe_sent=1`
 5. Client: sees marker `0x03+'TPS'` → **DOWNGRADE DETECTED** → `kill=1` → NF_DROP all packets →
 adds server to TOFU
 
+**Stream during MITM (strip TC option) — current client + current server:**
+
+1. SYN+ACK without TC → `TCPS_PLAIN_PROBE`
+2. Client: sends data as plain TCP (probe is not inserted)
+3. Server (in ENCRYPTED): receives data without MAC → NF_DROP
+4. Connection fails — MITM blocked
+5. Server logs: "data without MAC while ENCRYPTED — possible MITM"
+
 **Flow when no module is present on peer:**
 
 1. SYN+ACK without TC → `TCPS_PLAIN_PROBE`
-2. Client: sends probe request in data
-3. Server (without module): probe is regular bytes in the payload, the kernel passes it to the application as is
-4. The application can ignore it or return an error (36 extra bytes)
-5. 30 sec timeout → GC removes conn → the connection continues as plain TCP
+2. Client: sends data as plain TCP
+3. Server (without module): receives normal data
+4. 30 sec timeout → GC deletes conn → connection continues as plain TCP
 
-**After downgrade detection:**
-- The connection is killed (kill=1 → NF_DROP)
-- The peer is added to TOFU → next SYN+ACK without TC → NF_DROP (downgrade via TOFU cache)
-- MITM cannot be bypassed: even if it stops stripping, TOFU already protects
-
-**Probe limitations:**
-- Probe is sent only in the first data packet (if the client does not send data)
-(The probe won't escape.)
-- Probe response is sent only in the server's first data response.
-- 30-second timeout: if there is no response within this time, the probe is canceled.
-- The application sees 36 extra bytes if the server doesn't have the module (can be tolerated).
-- MITM with payload-modification capability can strip the probe (but this is significantly more difficult than stripping TCP options).
+**After downgrade detection (old client):**
+- Connection is killed (kill=1 → NF_DROP)
+- Peer is added to TOFU → next SYN+ACK without TC → NF_DROP (downgrade by TOFU cache)
+- MITM cannot be bypassed: even If it stops stripping, TOFU already protects.
 
 # Cryptography (without OpenSSL)
 
-- X25519 ECDH — 32-byte keys, via kernel crypto API (libcurve25519).
-- ChaCha20 — stream cipher, XOR on the stream position, without changing the packet size.
-- Poly1305 — AEAD MAC, proprietary implementation on 26-bit limbs.
-- **Per-packet Poly1305 key** — a unique key for each packet (ChaCha20(mac_key, pos + seq))
-- **MAC AAD covers TCP flags** — prevents FIN/flags substitution without detection
+- X25519 ECDH — 32-byte keys, via kernel crypto API (libcurve25519)
+- ChaCha20 — stream cipher, XOR on stream position, without changing packet size
+- Poly1305 — AEAD MAC, custom implementation on 26-bit limbs
+- **Per-packet Poly1305 key** — unique key for each packet (ChaCha20(mac_key, pos + seq))
+- **MAC AAD covers TCP flags** — prevents undetected FIN/flags substitution
 - KDF — HKDF-Expand pattern: each key is output separately with a unique label
 - `TCPS enc_c2s` (position 0x8000000000000000)
-- `TCPS enc_s2c` (position 0x8000000000000040)
+- `TCPS enc_s2c` (position 0x80000000000000040)
 - `TCPS mac_c2s` (position 0x8000000000000080)
 - `TCPS mac_s2c` (position 0x800000000000000C0)
 - Timing attack protection — MAC comparison via crypto_memneq (constant-time)
-- **Forward secrecy** — ephemeral DH keys are destroyed (memzero_explicit) after derivation
+- **Forward secrecy** — ephemeral DH keys (dh_priv) are destroyed (memzero_explicit) after derivation.
+Ephemeral pubkeys (dh_pub, dh_peer_pub) are preserved for auth_tag transcript binding.
 
 # MITM protection (TOFU + auth_tag + epoch)
 
-The static X25519 identity key is generated when the module loads. The private key is stored
+The static X25519 identity key is generated when the module is loaded. The private key is stored
 only in kernel RAM; it is never transmitted over the network or written to disk.
 
 **Two-phase protocol:**
 
 Phase 1 — SYN/SYN-ACK: ephemeral DH keys + epoch → encryption (forward secrecy)
-Phase 2 — ACK/data after encryption: TI (optional or embedded) with a static key → authentication
+Phase 2 — first data packet after encryption: embedded TI with a static key → authentication
 
-**TI option (40 bytes, pure ACK):** static_pubkey(32) + auth_tag(4)
-**Embedded TI (37 bytes, payload):** marker(1) + static_pubkey(32) + auth_tag(4)
-- auth_tag = ChaCha20-PRF(DH(my_static_priv, peer_static_pub), ISN_client || ISN_server || "TAUT")[:4]
-- auth_tag = 0 on first connection (no peer key in TOFU cache)
-- **auth_tag is linked to ISN** — MITM cannot relay someone else's TI between different sessions
+**Embedded TI (49 bytes, payload):** marker(1) + static_pubkey(32) + auth_tag(16)
+- auth_tag = Poly1305(DH(my_static_priv, peer_static_pub), client_dh || server_dh || ISN_client || ISN_server || is_client)
+- auth_tag is bound to ISN + ephemeral DH keys — MITM cannot relay between sessions
+- auth_tag = 0 (zero) on the first connection (the sender does not know the key) peer)
+
+**TI option (52 bytes):** kind(1) + len(1) + 'T'(1) + 'I'(1) + static_pub(32) + auth_tag(16)
+- **Not used for sending** — 52 bytes exceed the TCP options limit (40 bytes)
+- The reception code is preserved for compatibility with future protocol versions.
 
 **TOFU (Trust On First Use):**
 - First connection: the peer's static pubkey + epoch are stored in the TOFU cache (IP → pubkey + epoch)
-- Subsequent connections: the pubkey is checked against the cache, the auth_tag is verified **always** (including zero)
+- auth_tag = 0: registration without verification (TOFU trust, like SSH)
+- auth_tag ≠ 0: verification via DH(static_priv, peer_pub) — the sender knows our key
+- Subsequent connections: the pubkey is checked against the cache, the auth_tag is verified (zero auth_tag for (known peer = downgrade)
 - Mismatch of pubkey or auth_tag → MITM detected → NF_DROP
-- The TOFU cache is automatically used to protect against downgrades (see Autodiscovery + Probe)
+- If TOFU fails: `kill=1` + `TCPS_DEAD` — all subsequent packets are dropped, encrypted data is not leaked to the application
+- The TOFU cache is automatically used for downgrade protection (see Autodiscovery + Probe)
 
 **Epoch — Reboot/Key Rotation Detection:**
 
-A random 32-bit epoch is generated each time the module is loaded. It is passed to the TC option
-and stored in the TOFU cache next to the pubkey. If the pubkey does not match:
+A random 32-bit `epoch` is generated each time the module is loaded. It is passed in the TC option
+and stored in the TOFU cache next to the pubkey. If the pubkey mismatches:
 
-| Condition | Response |
-|---------|--------|
-| pubkey matches | Standard auth_tag verification |
-| pubkey ≠, epoch ≠ | **Key rotation** (likely a reboot) — auto-accept + warning |
-| pubkey ≠, same epoch | **MITM** — drop connection |
+| Condition | auth_tag | Response |
+|---------|----------|---------|
+| pubkey matches | ≠ 0 | Auth_tag verification |
+| pubkey matches | = 0 | **Downgrade** — drop (sender doesn't know our key) |
+| pubkey ≠, epoch ≠ | any | **Key rotation** — accept with warning (encrypted channel protects TI) |
+| pubkey ≠, epoch same | — | **MITM** — drop connection |
 
 Key rotation (new epoch + new pubkey) is automatically accepted when `auto_rotate=1` (default).
-When `auto_rotate=0` — any key change = MITM, requiring a manual module reboot on both sides.
+When `auto_rotate=0` — any key change = MITM, requiring a manual restart of the module on both sides.
+
+During rotation, the auth_tag may not match (the sender calculated it using our old key).
+This is acceptable: the TI is transmitted within an encrypted channel, and MITM cannot replace it.
 
 **auth_tag prevents forwarding someone else's pubkey:**
-MITM cannot forge the auth_tag—this requires a static private key,
-which only the legitimate peer has. ISN binding prevents relay attacks
+MITM attacks can't forge an auth_tag—this requires a static private key,
+which only the legitimate peer has. ISN+DH binding prevents relay attacks
 (an attempt to forward someone else's auth_tag between two different sessions).
 
-**Limitation:** The first connection is trusted without verification (like SSH),
-but an in-band probe closes this window for most MITM tools.
+**Limitation:** the first connection is trusted without verification (like SSH);
+the server-side in-band probe closes this window for clients running an older version of the module.
 
 **Module Parameters:**
 
 | Parameter | Default | Description |
 |----------|------------|-----------|
-| `tofu_enforce` | 1 | 0 = log only, 1 = drop if TOFU does not match |
-| `enforce` | 0 | 0=allow plain TCP for unknown peers, 1=drop all non-TCPS |
+| `tofu_enforce` | 1 | 0=log only, 1=drop if TOFU doesn't match |
+| `enforce` | 0 | 0=allow plain TCP
+For unknown peers, 1=drop all non-TCPS |
 | `auto_rotate` | 1 | 0=reject key rotation, 1=auto-accept on epoch change |
 
 ```bash
@@ -187,46 +204,74 @@ echo 0 > /sys/module/tcps/parameters/auto_rotate
 
 **Downgrade attack** (strip TCPS options):
 - SYN+ACK without TCPS option from a peer that is **already in TOFU** → NF_DROP (downgrade!)
-- SYN+ACK without TCPS option from a **new** peer → in-band probe → MITM autodetect
+- SYN+ACK without TCPS option from a **new** peer → plain TCP (peer has no module)
 - SYN without TCPS option from a client that is **already in TOFU** → NF_DROP (downgrade!)
-- TI option not added → NF_DROP (the connection is blocked, not falling back to plaintext)
 - TM option not added → NF_DROP
 - `enforce=1` additionally drops SYN from any clients without a TCPS option on the server
 
-**In-band probe** — closes the first-use window:
-- If MITM strips the TC option on the first connection → probe detects that the module is present → DOWNGRADE DETECTED
-- MITM can bypass probe only by modifying the TCP payload (much more complex than stripping)
-p options)
-- After detection: kill the connection + add to TOFU → all future connections are protected.
+**MITM strips SYN+ACK (server in ENCRYPTED, client in PLAIN_PROBE):**
+- Client sends data without MAC (PLAIN_PROBE)
+- Server receives data without MAC → NF_DROP
+- Connection fails — MITM blocked
+- Server logs: "data without MAC while ENCRYPTED — possible MITM"
+
+**In-band probe (server part)** — for compatibility with older clients:
+- Old client sends probe request in payload → The server detects a token
+- The server strips the probe, deactivates the conn in PLAIN_PROBE, and sends a probe response
+- The client detects DOWNGRADE DETECTED → kill the connection
 
 **RST injection**: Inbound RST packets in the encrypted state (ENCRYPTED/AUTHENTICATED)
-are dropped. A spoofed RST cannot terminate an encrypted session. The connection is closed
-only via FIN or GC timeout.
+are dropped without changing state. A spoofed RST cannot terminate an encrypted session.
+Outbound RST (the application closes the connection) is allowed by setting `kill=1` + `TCPS_DEAD`.
+The connection is closed only via FIN or GC timeout.
 
 **TI timeout**: If a TI is not received within 30 seconds (TCPS_TI_TIMEOUT), the GC kills the connection.
-Prevents an eternal hang in ENCRYPTED mode without authentication.
+Prevents an eternal hang in ENCRYPTED without authentication. If both sides send only a pure ACK (no data), the TI cannot be sent,
+the connection will remain in ENCRYPTED mode until the timeout.
 
-**Probe timeout**: If a probe response is not received within 30 seconds (TCPS_PROBE_TIMEOUT), the GC deletes the conn — the peer truly has no module, plain TCP continues.
+**Probe timeout**: If a probe response is not received within 30 seconds (TCPS_PROBE_TIMEOUT),
+the GC deletes the connection—the peer truly has no module, and plain TCP continues.
 
-# Embedded TI — sending identity in payload
+# Embedded TI—sending identity in the payload
 
-Problem: The TI option (40 bytes) and TM option (20 bytes) don't fit together in the 60-byte TCP header. If the first packet after encryption contains data, the TI is deferred until pure ACK — the connection remains ENCRYPTED without authentication.
+TI (Trust Identity) is embedded at the beginning of the payload of the first data packet. A pure ACK without data
+cannot carry a TI (TI option 52 bytes exceeds the TCP options limit of 40 bytes).
 
-**Solution**: If ti_sent==0 and a payload is present, the TI is embedded at the beginning of the payload:
+**Embedding condition:** `!ti_sent && payload_len > 0 && (state == ENCRYPTED || state == AUTHENTICATED)`
+
+This is critical for request-response protocols (HTTP, SQL, Redis, Kafka):
+the server receives the client's TI first → switches to AUTHENTICATED → sends a response.
+Without the AUTHENTICATED condition, the server would never send its TI, and the client would not know
+the server's static pubkey → repeated connections would fail with "zero auth_tag for known peer".
+
+**Encrypt-then-MAC Protocol:**
 
 ```
 Sender:
-[TCP hdr+opts][TI prefix(37, plaintext)][encrypted_app_data][TM option(20)]
+1. Generates a TI prefix: [0x01][static_pub(32)][auth_tag(16)] = 49 bytes
+2. Prepends the TI prefix to the payload: [TI prefix][app_data]
+3. Encrypts the ENTIRE payload including the TI prefix: ChaCha20(key, pos, data)
+4. Calculates the MAC: Poly1305(mac_key, pos, flags, encrypted_payload)
+5. Adds the TM option (20 bytes)
 
-TI prefix = [0x01][static_pub(32)][auth_tag(4)]
+Packet: [TCP hdr+opts][encrypted TI prefix(49)][encrypted app_data][TM option(20)]
 ```
 
-- TI prefix **is not encrypted** ChaCha20 — avoid position overlap
-- MAC (Poly1305) covers **both parts**: prefix + encrypted_data
-- Receiver: check MAC, decrypt, extract TI, TOFU-verify, strip 37 bytes
+```
+Receiver:
+1. Checks the MAC (TM option) → if not matched, Drop
+2. Decrypts payload: ChaCha20(key, pos, data)
+3. Verifies first byte == 0x01 → embedded TI
+4. Extracts static_pub + auth_tag from the decrypted payload
+5. TOFU + auth_tag verification
+6. Strip 49 bytes of TI prefix, adjust IP length + TCP checksum
+```
 
-Detection of embedded TI: first byte of payload == 0x01. Receiver subtracts 37 bytes,
-adjusts IP length and TCP checksum. The TCP stack only sees application data.
+Embedded TI detection: first byte of decrypted payload == 0x01. Receiver subtracts 49 bytes,
+adjusts IP length and TCP checksum. TCP stack sees only application data.
+
+**Limitation:** If both sides exchange only pure ACKs (no data in either direction),
+TI cannot be sent. The connection will remain ENCRYPTED until TCPS_TI_TIMEOUT (30 seconds).
 
 # Operation Scenarios
 
@@ -241,59 +286,89 @@ Step | Client (tcps.ko) | Server (tcps.ko)
 4 | X25519(eph_priv, peer_eph_pub) → shared | X25519(eph_priv, peer_eph_pub) → shared
 5 | HKDF-Expand(shared, label, ISN) → 4 keys | HKDF-Expand(shared, label, ISN) → 4 keys
 6 | ◄══════ ChaCha20 + Poly1305 (forward secret) ═► | Encrypted + integrity (MAC 16B)
-7a | pure ACK: TI option (static pub + auth_tag) ──► | TOFU + auth_tag verification
-7b | data: embedded TI (static pub + auth_tag) ───► | TOFU + auth_tag verification, strip 37B
-8 | ◄ TI option or embedded TI | TCPS_AUTHENTICATED on both sides
-| Applications (nginx/postgres/ssh) don't know anything
+7 | data: embedded TI (static pub + auth_tag) ───► | TOFU + auth_tag verification, strip 49B
+8 | | TCPS_AUTHENTICATED
+9 | ◄ embedded TI (static pub + auth_tag) | Server sends TI in AUTHENTICATED (ti_sent=0)
+10 | TOFU + auth_tag verification, strip 49B |
+11 | TCPS_AUTHENTICATED on both sides |
+| Applications (nginx/postgres/ssh) are unaware
 ```
 
-## Only one side has the module (auto-fallback)
+## Only one side has a module (auto-fallback)
 
 ```
 Step | Client (tcps.ko) | Server (no module)
 -----|------------------------------------------------|--------------------------------------------
 1 | SYN + TC option (ephemeral pubkey + epoch) ──► | Ignores unknown option 253
 2 | | SYN-ACK (without TC option)
-3 | ◄─────────────────────────────────────────────────── |
-4 | Peer not in TOFU → PLAIN_PROBE → probe sent |
-5 | [0x02][TPR][static_pub] + data ───────────────────► | Probe is just plain bytes, the kernel passes it to app.
-6 | Probe timeout 30 seconds → GC cleans conn | Regular TCP connection
+3 | ◄─ ... data (unmodified) ────────────────────────► | Normal data, HTTP request intact
+6 | Probe timeout 30 sec → GC cleaning conn | Normal TCP connection
 | apt-get update, DNS, HTTP — everything works!
 ```
 
-Reconnecting to the same server — PLAIN_PROBE again (the peer is not in TOFU, there is no module).
+Reconnecting to the same server — PLAIN_PROBE again (peer not in TOFU, no module).
 If the server later installs the module, the next connection will automatically become TCPS.
 
-## Downgrade attack blocked (the peer is already in TOFU)
+## Downgrade attack blocked (peer already in TOFU)
 
 ```
 Step | Client (tcps.ko) | MITM → Server (tcps.ko)
 -----|------------------------------------------------|--------------------------------------------
 1 | SYN + TC option ──► | MITM strips TC option
-2 | | SYN (without TC) ──► Server: client in TOFU → NF_DROP!
+2 | | SYN (no TC) ──► Server: client in TOFU → NF_DROP!
 | Or:
 1 | SYN + TC option ──► Server (tcps.ko) | SYN-ACK + TC option
-2 | ◄── MITM strips TC from SYN-ACK | SYN-ACK (without TC)
+2 | ◄── MITM strips TC from SYN-ACK | SYN-ACK (no TC)
 3 | Peer in TOFU → NF_DROP! (downgrade detected) |
 ```
 
-## Downgrade on first connection - probe blocked
+## MITM strips SYN+ACK on first connection
+
+**Server in ENCRYPTED, client in PLAIN_PROBE:**
 
 ```
 Step | Client (tcps.ko) | MITM → Server (tcps.ko)
+----|------------------------------------------------|--------------------------------------------
+1 | SYN + TC option ──► MITM passes SYN ──────► | Server: sees TC → ENCRYPTED
+2 | | SYN+ACK + TC option ──►
+3 | ◄── MITM strips TC from SYN+ACK |
+4 | No peer in TOFU → PLAIN_PROBE → plain TCP | Server: ENCRYPTED, expecting MAC
+5 | data (no MAC) ──► | Server: no MAC → NF_DROP
+6 | | Connection fails — MITM blocked
+```
+
+**Old client sends probe (backward compatibility):**
+
+```
+Step | Client (old tcps.ko) | MITM → Server (tcps.ko)
 -----|------------------------------------------------|--------------------------------------------
-1 | SYN + TC option ──► | MITM strips TC option
-2 | | SYN (no TC) ──► Server: client not in TOFU → plain
-3 | | SYN-ACK (no TC) ◄── Server
-4 | ◄── MITM passes SYN-ACK unchanged |
-5 | Peer not in TOFU → PLAIN_PROBE |
-6 | [probe request + data] ──► | MITM not modified
-Payload is updated → probe arrives!
-7 | | Server: sees probe marker → creates conn, strip probe
+1-3 | (same sequence) |
+4 | No peer in TOFU → PLAIN_PROBE |
+5 | [probe request + data] ──► (no MAC) |
+6 | | Server: no MAC → probe marker found
+7 | | → Deactivates in PLAIN_PROBE, strip probe
 8 | | Server: [probe response + data] ──►
-9 | ◄── MITM does not modify payload → probe response arrives!
+9 | ◄── probe response received |
 10 | DOWNGRADE DETECTED! → kill=1 → NF_DROP |
 | Peer added to TOFU → next attempts → NF_DROP
+```
+
+## Restarting module (key rotation)
+
+```
+Step | Client (tcps.ko) | Server (tcps.ko — restarted)
+-----|------------------------------------------------|--------------------------------------------
+1 | SYN + TC option (epoch_A) ────────────────────► | Sees TC, SYN_RECV
+2 | | SYN-ACK + TC option (epoch_B — new!)
+3 | ◄────────────────────────────────────────────────────────────────────────────────── |
+4 | Sees new epoch → TCPS_ENCRYPTED | TCPS_ENCRYPTED
+5 | data: embedded TI (auth_tag with OLD server key) ► | tcps_tofu_verify: epoch differs
+6 | | → key rotation: auth_tag may not match
+7 | | → accept (encrypted channel protects TI)
+8 | | → TCPS_AUTHENTICATED
+9 | ◄ embedded TI (auth_tag = 0, no client key) | Server has no client in TOFU (cache cleared)
+10 | tcps_tofu_verify: new peer, auth_tag=0 |
+| → TOFU trust, registration | → TCPS_AUTHENTICATED on both sides
 ```
 
 # Deployment
@@ -309,7 +384,7 @@ insmod tcps.ko
 ```
 
 Any TCP connection between these machines is automatically encrypted.
-PostgreSQL, HTTP, SSH—anything. Connections to machines without a module are plain TCP (apt-get works).
+PoStgreSQL, HTTP, SSH—whatever you like. Connections to machines without a module are plain TCP (apt-get works).
 
 Unloading the module:
 ```bash
@@ -317,9 +392,10 @@ rmmod tcps
 ```
 
 When the module is reloaded, a new static identity key and a new epoch are generated.
-The TOFU cache is cleared. If `auto_rotate=1` on the other side, rotation is accepted automatically. If `auto_rotate=0`, both sides need to restart the module.
+The TOFU cache is cleared. If `auto_rotate=1` on the other side, rotation is accepted automatically (the auth_tag may not match, but the encrypted channel is protected by TI).
+If `auto_rotate=0`, both sides need to reload the module.
 
-# Checking operation
+# Verifying operation
 
 ## dmesg — sessions and errors
 
@@ -329,70 +405,87 @@ dmesg | grep tcps
 
 Loading module:
 ```
-tcps: module loaded, ECDH + ChaCha20-Poly1305 + TOFU active
+tcps: module loaded, ECDH (X25519) + ChaCha20-Poly1305 + TOFU active
 tcps: identity fingerprint: a1b2c3d4e5f6a7b8 epoch: 1234567890
 ```
 
 Successful connection (first - TOFU remembers):
 ```
 tcps: encrypted session 192.168.1.69:41548 <-> 192.168.1.127:80 (ECDH+AEAD)
-tcps: TI option sent 192.168.1.69:41548 <-> 192.168.1.127:80
-tcps: TOFU: new peer 192.168.1.127 fingerprint 9a8b7c6d5e4f3a2b epoch: 1234567890
-tcps: session authenticated 192.168.1.69:41548 <-> 192.168.1.127:80 (TOFU+auth_tag)
-```
-
-Successful connection (retry - TOFU + auth_tag verification):
-```
-tcps: encrypted session 192.168.1.69:41550 <-> 192.168.1.127:80 (ECDH+AEAD)
-tcps: session authenticated 192.168.1.69:41550 <-> 192.168.1.127:80 (TOFU+auth_tag)
-```
-
-Embedded TI (first data packet) instead of pure ACK):
-```
 tcps: TI embedded in data 192.168.1.69:41548 <-> 192.168.1.127:80
+tcps: TOFU: new peer 192.168.1.127 fingerprint 9a8b7c6d5e4f3a2b epoch: 1234567890 (auth_tag present — see above for verification result)
 tcps: session authenticated (embedded TI) 192.168.1.69:41548 <-> 192.168.1.127:80
 ```
 
-Plain TCP probe (peer without module):
+Successful connection (repeated - TOFU + auth_tag verification):
 ```
-tcps: peer 93.184.216.34 has no TCPS module, probing
-tcps: probe sent 192.168.1.69:41548 <-> 93.184.216.34:80
+tcps: encrypted session 192.168.1.69:41550 <-> 192.168.1.127:80 (ECDH+AEAD)
+tcps: session authenticated (embedded TI) 192.168.1.69:41550 <-> 192.168.1.127:80
+```
+
+Plain TCP (peer without module):
+```
+tcps: peer 93.184.216.34 has no TCPS module, plain TCP
 tcps: probe timeout for 192.168.1.69:41548 <-> 93.184.216.34:80, peer has no module
 ```
 
-In-band probe — MITM detected on first connection:
+In-band probe — MITM detected (old client):
 ```
 tcps: peer 192.168.1.127 has no TCPS module, probing
 tcps: probe sent 192.168.1.69:41548 <-> 192.168.1.127:80
+tcps: DOWNGRADE DETECTED! Peer 192.168.1.127 has TCPS module but option was stripped
+```
+
+Probe from ENCRYPTED (MITM strips only SYN+ACK):
+```
+tcps: probe from 192.168.1.69 while ENCRYPTED — SYN+ACK was stripped, demoting to PLAIN_PROBE
+tcps: probe response sent 192.168.1.127:80 <-> 192.168.1.69:41548
 tcps: DOWNGRADE DETECTED! Peer 192.168.1.127 has a TCPS module, but the option was stripped.
 ```
 
-Server: probe received — MITM stripping options:
+MITM — data without MAC to the ENCRYPTED server:
 ```
-tcps: probe received from 192.168.1.69:41548 — TCPS option was stripped, possible MITM
-tcps: probe response sent 192.168.1.127:80 <-> 192.168.1.69:41548
+tcps: data without MAC from 192.168.1.69 while ENCRYPTED — possible MITM
 ```
 
-Key rotation (module reboot on one side, auto_rotate=1):
+Key rotation (module restart on one side, auto_rotate=1):
 ```
 tcps: key rotation detected for peer 192.168.1.127 (epoch 1234567890 -> 987654321)
 tcps: old fingerprint 9a8b7c6d5e4f3a2b, new fingerprint deadbeef12345678
+tcps: rotation auth_tag mismatch for 192.168.1.127 — sender has old key, accepting (encrypted channel) protects TI)
 tcps: session authenticated 192.168.1.69:41552 <-> 192.168.1.127:80 (TOFU+auth_tag)
 ```
 
-Downgrade detected (MITM stripping TCPS option from known peer):
+Rotation without auth_tag (peer rebooted, lost TOFU):
 ```
-tcps: downgrade detected! SYN+ACK without TCPS from known peer 192.168.1.127
+tcps: key rotation detected for peer 192.168.1.127 (epoch 1234567890 -> 987654321)
+tcps: rotation without auth_tag for 192.168.1.127 — sender has no key for us, accepting (encrypted channel protects TI)
+```
+
+New peer with auth_tag mismatch (reboot on our side, peer has our old key):
+```
+tcps: TOFU: new peer 192.168.1.127 auth_tag mismatch — sender has our old key or different key, accepting (encrypted channel protects TI)
+tcps: TOFU: new peer 192.168.1.127 fingerprint deadbeef12345678 epoch: 987654321 (auth_tag present — see above for verification result)
+```
+
+Downgrade detected (MITM strips TCPS option from known peer):
+```
+tcps: downgrade detected! SYN+ACK without TCPS from known peers 192.168.1.127
 tcps: downgrade detected! SYN without TCPS from known peer 192.168.1.127
 ```
 
-MITM attack (key mismatch, epoch same):
+Zero auth_tag for known peer (downgrade):
+```
+tcps: zero auth_tag for known peer 192.168.1.127 — possible downgrade
+```
+
+MITM attack (key mismatch, same epoch):
 ```
 tcps: MITM detected! Static key mismatch for peer 192.168.1.127 (same epoch 1234567890)
 tcps: expected 9a8b7c6d5e4f3a2b, got deadbeef12345678
 ```
 
-MITM attack (auth_tag mismatch - sending someone else's key):
+MITM attack (auth_tag mismatch — forwarding someone else's key):
 ```
 tcps: MITM detected! auth_tag mismatch for peer 192.168.1.127
 ```
@@ -417,42 +510,14 @@ Module activity indicators:
 
 | Indicator | Description |
 |---------|---------|
-| `unknown-253` in SYN | TC option with ephemeral X25519 pubkey + epoch (40 bytes, magic 'T', 'C') |
-| `unknown-253` in ACK | TI option with static pubkey + auth_tag (40 bytes, magic 'T', 'I') |
-| `unknown-253` in data | TM option with Poly1305 tag (20 bytes, magic 'T', 'M') |
+| `unknown-253` in SYN | TC option with ephemeral X25519 pubkey + epoch (40 bytes, magic 'T','C') |
+| `unknown-253` in data | TM option with Poly1305 tag (20 bytes, magic 'T','M') |
 | Unreadable data | Payload encrypted with ChaCha20 |
-| Readable data | Plain TCP — peer without module (not in TOFU) |
+| Readable data | Plain TCP - peer without modulus (not in TOFU) |
 
 Note: MSS is not included in SYN (TC option occupies all 40 option bytes).
 TCP uses the default MSS (536) before Path MTU Discovery.
 
-```bash
-# On the attacker: ARP spoofing (strip TC options, but NOT payload)
-sysctl -w net.ipv4.ip_forward=1
-arpspoof -i eth0 -t <CLIENT_IP> <SERVER_IP> &
-arpspoof -i eth0 -t <SERVER_IP> <CLIENT_IP> &
-# iptables: strip TCP option 253 from SYN/SYN+ACK
-iptables -t mangle -A FORWARD -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss 536
-# (or simply don't modify the payload—like arpspoof by default)
-
-# On the client: FIRST connection (TOFU yet)
-empty)
-insmod tcps.ko
-echo "test" | nc <SERVER_IP> 9000
-dmesg | grep tcps
-# → "peer <SERVER_IP> has no TCPS module, probing"
-# → "probe sent ..."
-# → "DOWNGRADE DETECTED! Peer <SERVER_IP> has a TCPS module but the option was stripped"
-# Connection killed! Data did NOT reach the MITM.
-
-# On the server:
-dmesg | grep tcps
-# → "probe received from <CLIENT_IP> — TCPS option was stripped, possible MITM"
-# → "probe response sent ..."
-
-# Reconnecting — TOFU protects:
-echo "test2" | nc <SERVER_IP> 9000
-# → "downgrade detected! SYN+ACK without TCPS from known peer <SERVER_IP>" → NF_DROP
 ```
 
 # Security Properties
@@ -461,35 +526,37 @@ echo "test2" | nc <SERVER_IP> 9000
 |----------|----------|
 | Encryption | ChaCha20 stream cipher |
 | Integrity | Poly1305 MAC (16 bytes, per-packet key, AAD covers TCP flags) |
-| FIN injection | FIN packets require a MAC, spoofed FIN is discarded |
-| Forward secrecy | Ephemeral X25519 DH keys, destroyed after derivation |
-| MITM protection | TOFU + auth_tag (static identity key) + ISN binding |
-| MITM relay | auth_tag is bound to ISN — forwarding between sessions is not possible |
-| Key rotation | Epoch — reboot detection, auto-rotate when epoch changes |
-| Downgrade protection | TOFU as a peer list + NF_DROP when stripping known peers |
-| Downgrade first-use | In-band probe via payload — MITM auto-detect on first connection |
+| FIN injection | FIN packets require MAC, spoofed FIN is discarded |
+| Forward secrecy | Ephemeral X25519 DH keys (dh_priv is destroyed after derivation) |
+| MITM protection | TOFU + auth_tag (Poly1305 MAC 16B, DH pubkeys + ISN in transcript) |
+| MITM relay | auth_tag is bound to ISN + ephemeral DH keys - forwarding is impossible |
+| Key rotation | Epoch - reboot detection, auto-rotate when epoch changes, encrypted channel protects TI |
+| Downgrade protection | TOFU as a peer list + NF_DROP when stripping from known peers |
+| Downgrade SYN+ACK strip | Server drops data without MAC → connection not established → MITM blocked |
+| Downgrade first-use (old client) | In-band probe via payload — auto-detect MITM on first connection |
 | Auto-discovery | TOFU cache automatically detects TCPS/Plain for each IP |
-| RST injection | Inbound RST is dropped in encrypted state |
+| RST injection | Inbound RST is dropped without changing state; outbound RST sets kill=1 |
 | Timing attacks | crypto_memneq for MAC and auth_tag |
 | Key separation | HKDF-Expand with unique labels for each key |
 | Key privacy | memzero_explicit, RAM only, not written to disk |
-| TI delivery | Embedded TI in payload — authentication with the first data packet |
+| TI delivery | Embedded TI in payload (Encrypt-then-MAC) — authentication with the first data packet |
+| TOFU failure | kill=1 on TOFU failure — encrypted data is not leaked to the application |
 
-# Known Limitations
+# Known limitations
 
 | Limitation | Description |
-|------------|----------|
+|-------------|----------|
 | IPv4 only | IPv6 not yet supported |
-| auth_tag 4 bytes | 32-bit security for identity verification. Increasing this value requires reconsidering the TI option (40B is the maximum TCP options) |
-| No connection limit | Limit 4096 (tcps_conn_count). If exceeded, SYN is dropped |
+| No connection limit | Limit is 4096 (tcps_conn_count). If exceeded, SYN is dropped |
 | TOFU kzalloc fail | Connection is rejected instead of trusted (return -1) |
 | RST delay | Legitimate RST from peer is dropped, closing via FIN/timeout |
 | Pure ACK is not authenticated | ACKs without FIN and without payload do not contain a MAC (overhead). FIN is protected |
-| TOFU in-memory cache | Lost during rmmod, keys are not saved to disk |
-| Epoch — heuristic | Not a cryptographic proof: an active MITM can replace the epoch+key with auto_rotate=1 |
-| MSS in SYN | TC option (40B) takes up the entire option space — MSS is not enabled. Default is 536, PMTU Discovery compensates |
-| Embedded TI marker | Byte 0x01 at the beginning of the payload — a collision with app data may result in DoS (packet drop) |
-| Probe without data | Probe is sent only in the data packet. If the client does not send data, the probe will not send |
-| Probe without response | If the server does not send data, the probe response will not be sent, timeout is 30 seconds |
-| Probe payload-mod MITM | A MITM with payload modification capabilities can strip the probe (much more complex than strip options) |
-| Probe + plain server | A server without a module receives 36 extra bytes in the probe's payload. The application may return an error |
+| Pure ACK without TI | If both sides send only ACKs without data, TI is not sent → TCPS_TI_TIMEOUT (30 sec) |
+| TOFU cache in-memory | Lost during rmmod, keys are not saved to disk |
+| Epoch — heuristic | Not a cryptographic proof: an active MITM can replace epoch+key with auto_rotate=1 |
+| MSS in SYN | TC option (40B) takes up the entire option space — MSS is not enabled. Default 536, PMTU Discovery compensates |
+| Embedded TI marker | Byte 0x01 at the beginning of the payload — a collision with app data can cause a DoS (packet drop) |
+| Probe payload-mod MITM | MITM with payload modification capability can strip the probe (much more complex than strip options) |
+| First-use trust | The first connection to a new peer without MITM detection is trusted (like SSH). MITM detection only occurs when receiving data without a MAC address to an ENCRYPTED server |
+| Key rotation auth_tag | During rotation, the auth_tag may not match (the sender calculated it with our old key). Protection: encrypted channel |
+| New peer auth_tag | For new peers, auth_tag does not block registration (the encrypted channel protects TI) |

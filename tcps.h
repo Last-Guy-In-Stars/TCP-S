@@ -18,10 +18,10 @@
 #define TCPS_MAC_TAG_SIZE   16
 
 #define TCPS_TI_OPT_KIND    253
-#define TCPS_TI_OPT_LEN     40
+#define TCPS_TI_OPT_LEN    52  /* too large for TCP options (max 40); TI via embedded payload only */
 #define TCPS_TI_MAGIC0      'T'
 #define TCPS_TI_MAGIC1      'I'
-#define TCPS_AUTH_TAG_SIZE  4
+#define TCPS_AUTH_TAG_SIZE  16
 
 #define TCPS_TI_EMBED_MARKER 0x01
 #define TCPS_TI_EMBED_SIZE   (1 + TCPS_DH_SIZE + TCPS_AUTH_TAG_SIZE)
@@ -122,6 +122,12 @@ void tcps_compute_mac_prefix(const uint8_t mac_key[TCPS_KEY_SIZE],
 			     const uint8_t *prefix, size_t prefix_len,
 			     const uint8_t *data, size_t data_len,
 			     uint8_t tag[TCPS_MAC_TAG_SIZE]);
+void tcps_compute_auth_tag(const uint8_t shared_static[TCPS_DH_SIZE],
+			   const uint8_t client_dh[TCPS_DH_SIZE],
+			   const uint8_t server_dh[TCPS_DH_SIZE],
+			   uint32_t client_isn, uint32_t server_isn,
+			   int is_client,
+			   uint8_t tag[TCPS_AUTH_TAG_SIZE]);
 
 struct tcps_peer_entry {
 	__be32 addr;
@@ -134,7 +140,11 @@ struct tcps_peer_entry {
 int tcps_tofu_verify(__be32 addr, const uint8_t pubkey[TCPS_DH_SIZE],
 		     const uint8_t auth_tag[TCPS_AUTH_TAG_SIZE],
 		     uint32_t client_isn, uint32_t server_isn,
-		     int is_client, uint32_t peer_epoch);
+		     int is_client, uint32_t peer_epoch,
+		     const uint8_t client_dh[TCPS_DH_SIZE],
+		     const uint8_t server_dh[TCPS_DH_SIZE]);
+int tcps_tofu_register(__be32 addr, const uint8_t pubkey[TCPS_DH_SIZE],
+		       uint32_t peer_epoch);
 void tcps_tofu_cleanup(void);
 
 #endif

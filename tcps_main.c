@@ -14,8 +14,8 @@
 #include <crypto/algapi.h>
 #include "tcps.h"
 
-MODULE_LICENSE("GPL");
-MODULE_AUTHOR("tcps");
+MODULE_LICENSE("MIT");
+MODULE_AUTHOR("ArtamonovKA - tcps");
 MODULE_DESCRIPTION("Transparent TCP encryption: ECDH + ChaCha20-Poly1305 + TOFU/MITM protection + forward secrecy");
 MODULE_SOFTDEP("pre: libcurve25519");
 
@@ -32,9 +32,9 @@ static int tcps_tofu_enforce = 1;
 module_param_named(tofu_enforce, tcps_tofu_enforce, int, 0644);
 MODULE_PARM_DESC(tofu_enforce, "TOFU enforcement: 0=off, 1=drop on key mismatch (default)");
 
-static int tcps_enforce;
+static int tcps_enforce = 0;
 module_param_named(enforce, tcps_enforce, int, 0644);
-MODULE_PARM_DESC(enforce, "Enforce encryption: 0=allow plaintext fallback, 1=drop non-TCPS connections (default: 0)");
+MODULE_PARM_DESC(enforce, "Enforce encryption: 0=allow plaintext fallback (default), 1=drop non-TCPS connections");
 
 static int tcps_auto_rotate = 1;
 module_param_named(auto_rotate, tcps_auto_rotate, int, 0644);
@@ -48,10 +48,6 @@ static void tcps_gc(struct work_struct *work);
 static DECLARE_DELAYED_WORK(tcps_gc_work, tcps_gc);
 
 static void tcps_conn_free_rcu(struct rcu_head *head);
-static void tcps_compute_auth_tag(const uint8_t shared_static[TCPS_DH_SIZE],
-				  uint32_t client_isn, uint32_t server_isn,
-				  int is_client,
-				  uint8_t tag[TCPS_AUTH_TAG_SIZE]);
 static void tcps_compute_send_auth_tag(struct tcps_conn *c,
 				       uint8_t auth_tag[TCPS_AUTH_TAG_SIZE]);
 
@@ -133,14 +129,14 @@ struct tcps_conn *tcps_conn_add(__be32 saddr, __be16 sport,
 
 	tcps_dh_keygen(dh_priv, dh_pub);
 
+	h = tcps_hash4(saddr, sport, daddr, dport);
+	spin_lock(&tcps_lock);
 	if (atomic_read(&tcps_conn_count) >= TCPS_MAX_CONN) {
+		spin_unlock(&tcps_lock);
 		memzero_explicit(dh_priv, sizeof(dh_priv));
 		memzero_explicit(dh_pub, sizeof(dh_pub));
 		return NULL;
 	}
-
-	h = tcps_hash4(saddr, sport, daddr, dport);
-	spin_lock(&tcps_lock);
 	hash_for_each_possible(tcps_table, c, hnode, h) {
 		if ((c->saddr == saddr && c->daddr == daddr &&
 		     c->sport == sport && c->dport == dport) ||
@@ -202,7 +198,7 @@ void tcps_conn_cleanup(void)
 	hash_for_each_safe(tcps_table, bkt, tmp, c, hnode) {
 		hash_del(&c->hnode);
 		atomic_dec(&tcps_conn_count);
-		memzero_explicit(c->dh_priv, sizeof(c->dh_priv));
+	memzero_explicit(c->dh_priv, sizeof(c->dh_priv));
 		memzero_explicit(c->dh_pub, sizeof(c->dh_pub));
 		memzero_explicit(c->dh_peer_pub, sizeof(c->dh_peer_pub));
 		memzero_explicit(c->enc_key, sizeof(c->enc_key));
@@ -216,13 +212,12 @@ void tcps_conn_cleanup(void)
 static void tcps_gc(struct work_struct *work)
 {
 	struct tcps_conn *c;
-	struct hlist_node *tmp;
 	unsigned bkt;
 	unsigned long now = jiffies;
 	int del;
 
-	spin_lock(&tcps_lock);
-	hash_for_each_safe(tcps_table, bkt, tmp, c, hnode) {
+	rcu_read_lock();
+	hash_for_each_rcu(tcps_table, bkt, c, hnode) {
 		del = 0;
 		spin_lock(&c->lock);
 		if (c->state == TCPS_DEAD &&
@@ -245,41 +240,78 @@ static void tcps_gc(struct work_struct *work)
 				&c->daddr, ntohs(c->dport));
 			del = 1;
 		}
+		else if (c->state == TCPS_SYN_SENT &&
+			 time_after(now, c->last_active + TCPS_TI_TIMEOUT)) {
+			pr_info("tcps: SYN_SENT timeout for %pI4:%u <-> %pI4:%u\n",
+				&c->saddr, ntohs(c->sport),
+				&c->daddr, ntohs(c->dport));
+			del = 1;
+		}
+		else if (c->state == TCPS_SYN_RECV &&
+			 time_after(now, c->last_active + TCPS_TI_TIMEOUT)) {
+			pr_info("tcps: SYN_RECV timeout for %pI4:%u <-> %pI4:%u\n",
+				&c->saddr, ntohs(c->sport),
+				&c->daddr, ntohs(c->dport));
+			del = 1;
+		}
 		else if (time_after(now, c->last_active + TCPS_IDLE_TIMEOUT))
 			del = 1;
+		if (del)
+			c->state = TCPS_DEAD;
 		spin_unlock(&c->lock);
 		if (del) {
-			hash_del_rcu(&c->hnode);
-			atomic_dec(&tcps_conn_count);
-			call_rcu(&c->rcu, tcps_conn_free_rcu);
+			spin_lock(&tcps_lock);
+			if (!hlist_unhashed(&c->hnode)) {
+				hash_del_rcu(&c->hnode);
+				atomic_dec(&tcps_conn_count);
+				call_rcu(&c->rcu, tcps_conn_free_rcu);
+			}
+			spin_unlock(&tcps_lock);
 		}
 	}
-	spin_unlock(&tcps_lock);
+	rcu_read_unlock();
 	schedule_delayed_work(&tcps_gc_work, TCPS_GC_INTERVAL);
+}
+
+static int tcps_auth_tag_is_zero(const uint8_t tag[TCPS_AUTH_TAG_SIZE])
+{
+	int i;
+	for (i = 0; i < TCPS_AUTH_TAG_SIZE; i++)
+		if (tag[i])
+			return 0;
+	return 1;
 }
 
 int tcps_tofu_verify(__be32 addr, const uint8_t pubkey[TCPS_DH_SIZE],
 		     const uint8_t auth_tag[TCPS_AUTH_TAG_SIZE],
 		     uint32_t client_isn, uint32_t server_isn,
-		     int is_client, uint32_t peer_epoch)
+		     int is_client, uint32_t peer_epoch,
+		     const uint8_t client_dh[TCPS_DH_SIZE],
+		     const uint8_t server_dh[TCPS_DH_SIZE])
 {
 	struct tcps_peer_entry *p, *new_p;
 	uint32_t h = jhash_1word((__force u32)addr, 0);
+	int mismatch;
+	int has_tag = !tcps_auth_tag_is_zero(auth_tag);
+	uint8_t saved_pub[TCPS_DH_SIZE];
+	uint32_t saved_epoch;
 
-	rcu_read_lock();
-	hash_for_each_possible_rcu(tcps_peers_table, p, hnode, h) {
+	spin_lock(&tcps_peers_lock);
+	hash_for_each_possible(tcps_peers_table, p, hnode, h) {
 		if (p->addr == addr) {
-			uint8_t saved_pub[TCPS_DH_SIZE];
-			uint32_t saved_epoch;
-			int mismatch;
-
 			memcpy(saved_pub, p->pubkey, TCPS_DH_SIZE);
 			saved_epoch = p->epoch;
-			rcu_read_unlock();
 
 			mismatch = crypto_memneq(saved_pub, pubkey, TCPS_DH_SIZE);
 			if (!mismatch) {
-				if (auth_tag) {
+				if (!has_tag) {
+					pr_warn("tcps: zero auth_tag for known peer %pI4 — possible downgrade\n",
+						&addr);
+					memzero_explicit(saved_pub, sizeof(saved_pub));
+					spin_unlock(&tcps_peers_lock);
+					return -1;
+				}
+				{
 					uint8_t shared[TCPS_DH_SIZE];
 					uint8_t expected[TCPS_AUTH_TAG_SIZE];
 
@@ -287,11 +319,14 @@ int tcps_tofu_verify(__be32 addr, const uint8_t pubkey[TCPS_DH_SIZE],
 							   shared) < 0) {
 						memzero_explicit(shared, sizeof(shared));
 						memzero_explicit(saved_pub, sizeof(saved_pub));
+						spin_unlock(&tcps_peers_lock);
 						pr_warn("tcps: auth_tag DH failed for %pI4\n",
 							&addr);
 						return -1;
 					}
-					tcps_compute_auth_tag(shared, client_isn,
+					tcps_compute_auth_tag(shared, client_dh,
+							      server_dh,
+							      client_isn,
 							      server_isn, is_client,
 							      expected);
 					memzero_explicit(shared, sizeof(shared));
@@ -299,6 +334,7 @@ int tcps_tofu_verify(__be32 addr, const uint8_t pubkey[TCPS_DH_SIZE],
 							  TCPS_AUTH_TAG_SIZE)) {
 						memzero_explicit(expected, sizeof(expected));
 						memzero_explicit(saved_pub, sizeof(saved_pub));
+						spin_unlock(&tcps_peers_lock);
 						pr_warn("tcps: MITM detected! auth_tag mismatch for peer %pI4\n",
 							&addr);
 						return -1;
@@ -306,16 +342,10 @@ int tcps_tofu_verify(__be32 addr, const uint8_t pubkey[TCPS_DH_SIZE],
 					memzero_explicit(expected, sizeof(expected));
 				}
 				if (saved_epoch != peer_epoch) {
-					spin_lock(&tcps_peers_lock);
-					hash_for_each_possible(tcps_peers_table, p, hnode, h) {
-						if (p->addr == addr) {
-							p->epoch = peer_epoch;
-							break;
-						}
-					}
-					spin_unlock(&tcps_peers_lock);
+					p->epoch = peer_epoch;
 				}
 				memzero_explicit(saved_pub, sizeof(saved_pub));
+				spin_unlock(&tcps_peers_lock);
 				return 1;
 			}
 
@@ -324,6 +354,7 @@ int tcps_tofu_verify(__be32 addr, const uint8_t pubkey[TCPS_DH_SIZE],
 					pr_warn("tcps: key rotation rejected for peer %pI4 (auto_rotate=0, epoch %u -> %u)\n",
 						&addr, saved_epoch, peer_epoch);
 					memzero_explicit(saved_pub, sizeof(saved_pub));
+					spin_unlock(&tcps_peers_lock);
 					return -1;
 				}
 				pr_warn("tcps: key rotation detected for peer %pI4 (epoch %u -> %u)\n",
@@ -331,7 +362,7 @@ int tcps_tofu_verify(__be32 addr, const uint8_t pubkey[TCPS_DH_SIZE],
 				pr_warn("tcps: old fingerprint %*phN, new fingerprint %*phN\n",
 					8, saved_pub, 8, pubkey);
 
-				if (auth_tag) {
+				if (has_tag) {
 					uint8_t shared[TCPS_DH_SIZE];
 					uint8_t expected[TCPS_AUTH_TAG_SIZE];
 
@@ -339,36 +370,35 @@ int tcps_tofu_verify(__be32 addr, const uint8_t pubkey[TCPS_DH_SIZE],
 							   shared) < 0) {
 						memzero_explicit(shared, sizeof(shared));
 						memzero_explicit(saved_pub, sizeof(saved_pub));
+						spin_unlock(&tcps_peers_lock);
 						pr_warn("tcps: rotation auth_tag DH failed for %pI4\n",
 							&addr);
 						return -1;
 					}
-					tcps_compute_auth_tag(shared, client_isn,
+					tcps_compute_auth_tag(shared, client_dh,
+							      server_dh,
+							      client_isn,
 							      server_isn, is_client,
 							      expected);
 					memzero_explicit(shared, sizeof(shared));
 					if (crypto_memneq(auth_tag, expected,
 							  TCPS_AUTH_TAG_SIZE)) {
 						memzero_explicit(expected, sizeof(expected));
-						memzero_explicit(saved_pub, sizeof(saved_pub));
-						pr_warn("tcps: rotation auth_tag mismatch for peer %pI4\n",
+						pr_warn("tcps: rotation auth_tag mismatch for %pI4 — sender has old key, accepting (encrypted channel protects TI)\n",
 							&addr);
-						return -1;
+					} else {
+						memzero_explicit(expected, sizeof(expected));
 					}
-					memzero_explicit(expected, sizeof(expected));
+				} else {
+					pr_warn("tcps: rotation without auth_tag for %pI4 — sender has no key for us, accepting (encrypted channel protects TI)\n",
+						&addr);
 				}
 
-				spin_lock(&tcps_peers_lock);
-				hash_for_each_possible(tcps_peers_table, p, hnode, h) {
-					if (p->addr == addr) {
-						memcpy(p->pubkey, pubkey, TCPS_DH_SIZE);
-						p->epoch = peer_epoch;
-						break;
-					}
-				}
-				spin_unlock(&tcps_peers_lock);
+				memcpy(p->pubkey, pubkey, TCPS_DH_SIZE);
+				p->epoch = peer_epoch;
 
 				memzero_explicit(saved_pub, sizeof(saved_pub));
+				spin_unlock(&tcps_peers_lock);
 				return 1;
 			}
 
@@ -377,116 +407,91 @@ int tcps_tofu_verify(__be32 addr, const uint8_t pubkey[TCPS_DH_SIZE],
 			pr_warn("tcps: expected %*phN, got %*phN\n",
 				8, saved_pub, 8, pubkey);
 			memzero_explicit(saved_pub, sizeof(saved_pub));
+			spin_unlock(&tcps_peers_lock);
 			return -1;
 		}
 	}
-	rcu_read_unlock();
+
+	if (has_tag) {
+		uint8_t shared[TCPS_DH_SIZE];
+		uint8_t expected[TCPS_AUTH_TAG_SIZE];
+
+		if (tcps_dh_shared(tcps_static_priv, pubkey, shared) == 0) {
+			tcps_compute_auth_tag(shared, client_dh, server_dh,
+					      client_isn, server_isn,
+					      is_client, expected);
+			if (!crypto_memneq(auth_tag, expected,
+					   TCPS_AUTH_TAG_SIZE)) {
+				pr_info("tcps: TOFU: new peer %pI4 auth_tag verified (sender knows our key)\n",
+					&addr);
+			} else {
+				pr_warn("tcps: TOFU: new peer %pI4 auth_tag mismatch — sender has our old key or different key, accepting (encrypted channel protects TI)\n",
+					&addr);
+			}
+			memzero_explicit(expected, sizeof(expected));
+		} else {
+			pr_warn("tcps: TOFU: new peer %pI4 auth_tag DH failed, accepting (encrypted channel protects TI)\n",
+				&addr);
+		}
+		memzero_explicit(shared, sizeof(shared));
+	}
 
 	new_p = kzalloc(sizeof(*new_p), GFP_ATOMIC);
-	if (!new_p)
+	if (!new_p) {
+		spin_unlock(&tcps_peers_lock);
 		return -1;
+	}
 
 	new_p->addr = addr;
 	memcpy(new_p->pubkey, pubkey, TCPS_DH_SIZE);
 	new_p->epoch = peer_epoch;
+	hash_add_rcu(tcps_peers_table, &new_p->hnode, h);
+	spin_unlock(&tcps_peers_lock);
+
+	if (has_tag)
+		pr_warn("tcps: TOFU: new peer %pI4 fingerprint %*phN epoch %u (auth_tag present — see above for verification result)\n",
+			&addr, 8, pubkey, peer_epoch);
+	else
+		pr_warn("tcps: TOFU: new peer %pI4 fingerprint %*phN epoch %u (NO auth_tag — verify out-of-band!)\n",
+			&addr, 8, pubkey, peer_epoch);
+	return 0;
+}
+
+int tcps_tofu_register(__be32 addr, const uint8_t pubkey[TCPS_DH_SIZE],
+		       uint32_t peer_epoch)
+{
+	struct tcps_peer_entry *p, *new_p;
+	uint32_t h = jhash_1word((__force u32)addr, 0);
 
 	spin_lock(&tcps_peers_lock);
 	hash_for_each_possible(tcps_peers_table, p, hnode, h) {
 		if (p->addr == addr) {
-			uint8_t saved_pub[TCPS_DH_SIZE];
-			uint32_t saved_epoch;
-			int mismatch;
-
-			memcpy(saved_pub, p->pubkey, TCPS_DH_SIZE);
-			saved_epoch = p->epoch;
-			spin_unlock(&tcps_peers_lock);
-			kfree(new_p);
-			mismatch = crypto_memneq(saved_pub, pubkey, TCPS_DH_SIZE);
-			if (!mismatch) {
-				if (auth_tag) {
-					uint8_t shared[TCPS_DH_SIZE];
-					uint8_t expected[TCPS_AUTH_TAG_SIZE];
-
-					if (tcps_dh_shared(tcps_static_priv, saved_pub,
-							   shared) < 0) {
-						memzero_explicit(shared, sizeof(shared));
-						memzero_explicit(saved_pub, sizeof(saved_pub));
-						return -1;
-					}
-					tcps_compute_auth_tag(shared, client_isn,
-							      server_isn, is_client,
-							      expected);
-					memzero_explicit(shared, sizeof(shared));
-					if (crypto_memneq(auth_tag, expected,
-							  TCPS_AUTH_TAG_SIZE)) {
-						memzero_explicit(expected, sizeof(expected));
-						memzero_explicit(saved_pub, sizeof(saved_pub));
-						pr_warn("tcps: MITM detected! auth_tag mismatch for peer %pI4\n",
-							&addr);
-						return -1;
-					}
-					memzero_explicit(expected, sizeof(expected));
-				}
-				memzero_explicit(saved_pub, sizeof(saved_pub));
-				return 1;
-			}
-
-			if (peer_epoch != saved_epoch) {
-				if (!tcps_auto_rotate) {
-					memzero_explicit(saved_pub, sizeof(saved_pub));
-					pr_warn("tcps: key rotation rejected for peer %pI4 (auto_rotate=0)\n",
-						&addr);
-					return -1;
-				}
-				pr_warn("tcps: key rotation detected for peer %pI4 (epoch %u -> %u)\n",
-					&addr, saved_epoch, peer_epoch);
-				if (auth_tag) {
-					uint8_t shared[TCPS_DH_SIZE];
-					uint8_t expected[TCPS_AUTH_TAG_SIZE];
-
-					if (tcps_dh_shared(tcps_static_priv, pubkey,
-							   shared) < 0) {
-						memzero_explicit(shared, sizeof(shared));
-						memzero_explicit(saved_pub, sizeof(saved_pub));
-						return -1;
-					}
-					tcps_compute_auth_tag(shared, client_isn,
-							      server_isn, is_client,
-							      expected);
-					memzero_explicit(shared, sizeof(shared));
-					if (crypto_memneq(auth_tag, expected,
-							  TCPS_AUTH_TAG_SIZE)) {
-						memzero_explicit(expected, sizeof(expected));
-						memzero_explicit(saved_pub, sizeof(saved_pub));
-						return -1;
-					}
-					memzero_explicit(expected, sizeof(expected));
-				}
-
-				spin_lock(&tcps_peers_lock);
-				hash_for_each_possible(tcps_peers_table, p, hnode, h) {
-					if (p->addr == addr) {
-						memcpy(p->pubkey, pubkey, TCPS_DH_SIZE);
-						p->epoch = peer_epoch;
-						break;
-					}
-				}
+			if (crypto_memneq(p->pubkey, pubkey, TCPS_DH_SIZE)) {
 				spin_unlock(&tcps_peers_lock);
-
-				memzero_explicit(saved_pub, sizeof(saved_pub));
-				return 1;
+				pr_warn("tcps: probe TOFU mismatch for %pI4 — existing key, not overwriting\n",
+					&addr);
+				return -1;
 			}
-
-			memzero_explicit(saved_pub, sizeof(saved_pub));
-			pr_warn("tcps: MITM detected! Static key mismatch for peer %pI4 (same epoch %u)\n",
-				&addr, saved_epoch);
-			return -1;
+			if (p->epoch != peer_epoch && peer_epoch != 0)
+				p->epoch = peer_epoch;
+			spin_unlock(&tcps_peers_lock);
+			return 1;
 		}
 	}
+
+	new_p = kzalloc(sizeof(*new_p), GFP_ATOMIC);
+	if (!new_p) {
+		spin_unlock(&tcps_peers_lock);
+		return -1;
+	}
+
+	new_p->addr = addr;
+	memcpy(new_p->pubkey, pubkey, TCPS_DH_SIZE);
+	new_p->epoch = peer_epoch;
 	hash_add_rcu(tcps_peers_table, &new_p->hnode, h);
 	spin_unlock(&tcps_peers_lock);
 
-	pr_info("tcps: TOFU: new peer %pI4 fingerprint %*phN epoch %u\n",
+	pr_warn("tcps: TOFU: probe-registered peer %pI4 fingerprint %*phN epoch %u (NO auth_tag — verify out-of-band!)\n",
 		&addr, 8, pubkey, peer_epoch);
 	return 0;
 }
@@ -596,8 +601,11 @@ static int add_tcps_option(struct sk_buff *skb,
 
 	old_hdr_len = th->doff * 4;
 	new_hdr_len = sizeof(struct tcphdr) + new_opt_len;
-	if (new_hdr_len > 60)
+	if (new_hdr_len > 60) {
+		pr_warn_ratelimited("tcps: no room for TCPS option (hdr %d > 60), dropping\n",
+				    new_hdr_len);
 		return -ENOSPC;
+	}
 
 	diff = new_hdr_len - old_hdr_len;
 	new_doff = new_hdr_len / 4;
@@ -665,8 +673,11 @@ static int add_mac_option(struct sk_buff *skb, const uint8_t tag[TCPS_MAC_TAG_SI
 	uint8_t *opt;
 	int off;
 
-	if (new_hdr_len > 60)
+	if (new_hdr_len > 60) {
+		pr_warn_ratelimited("tcps: no room for MAC option (hdr %d > 60), dropping\n",
+				    new_hdr_len);
 		return -ENOSPC;
+	}
 
 	new_doff = new_hdr_len / 4;
 
@@ -752,91 +763,6 @@ static int tcp_option_find_ti(struct tcphdr *th,
 	return 0;
 }
 
-static int add_ti_option(struct sk_buff *skb,
-			 const uint8_t static_pub[TCPS_DH_SIZE],
-			 const uint8_t auth_tag[TCPS_AUTH_TAG_SIZE])
-{
-	struct iphdr *iph = ip_hdr(skb);
-	struct tcphdr *th = tcp_hdr(skb);
-	int new_hdr_len = sizeof(struct tcphdr) + TCPS_TI_OPT_LEN;
-	int old_hdr_len = th->doff * 4;
-	int diff = new_hdr_len - old_hdr_len;
-	int new_doff = new_hdr_len / 4;
-	int tcplen;
-	uint8_t *opt;
-
-	if (new_hdr_len > 60)
-		return -ENOSPC;
-
-	if (diff > 0) {
-		if (skb_tailroom(skb) < diff) {
-			if (pskb_expand_head(skb, 0,
-					     diff - skb_tailroom(skb),
-					     GFP_ATOMIC))
-				return -ENOMEM;
-			iph = ip_hdr(skb);
-			th = tcp_hdr(skb);
-		}
-		skb_put(skb, diff);
-	} else if (diff < 0) {
-		skb_trim(skb, skb->len + diff);
-	}
-
-	if (skb_ensure_writable(skb, skb->len))
-		return -ENOMEM;
-	iph = ip_hdr(skb);
-	th = tcp_hdr(skb);
-
-	opt = (uint8_t *)th + sizeof(struct tcphdr);
-	opt[0] = TCPS_TI_OPT_KIND;
-	opt[1] = TCPS_TI_OPT_LEN;
-	opt[2] = TCPS_TI_MAGIC0;
-	opt[3] = TCPS_TI_MAGIC1;
-	memcpy(opt + 4, static_pub, TCPS_DH_SIZE);
-	memcpy(opt + 4 + TCPS_DH_SIZE, auth_tag, TCPS_AUTH_TAG_SIZE);
-
-	th->doff = new_doff;
-	iph->tot_len = htons(ntohs(iph->tot_len) + diff);
-	iph->check = 0;
-	iph->check = ip_fast_csum((unsigned char *)iph, iph->ihl);
-
-	tcplen = ntohs(iph->tot_len) - iph->ihl * 4;
-	th->check = 0;
-	th->check = csum_tcpudp_magic(iph->saddr, iph->daddr,
-				      tcplen, IPPROTO_TCP,
-				      csum_partial(th, tcplen, 0));
-	skb->ip_summed = CHECKSUM_NONE;
-	return 0;
-}
-
-static void tcps_compute_auth_tag(const uint8_t shared_static[TCPS_DH_SIZE],
-				  uint32_t client_isn, uint32_t server_isn,
-				  int is_client,
-				  uint8_t tag[TCPS_AUTH_TAG_SIZE])
-{
-	uint8_t input[16];
-	uint64_t pos = (3ULL << 62) & ~15ULL;
-
-	memset(input, 0, 16);
-	input[0] = (uint8_t)(client_isn >> 24);
-	input[1] = (uint8_t)(client_isn >> 16);
-	input[2] = (uint8_t)(client_isn >> 8);
-	input[3] = (uint8_t)(client_isn);
-	input[4] = (uint8_t)(server_isn >> 24);
-	input[5] = (uint8_t)(server_isn >> 16);
-	input[6] = (uint8_t)(server_isn >> 8);
-	input[7] = (uint8_t)(server_isn);
-	input[8] = 'T';
-	input[9] = 'A';
-	input[10] = 'U';
-	input[11] = 'T';
-	input[12] = is_client ? 1 : 0;
-
-	chacha20_xor_stream(shared_static, pos, input, 16);
-	memcpy(tag, input, TCPS_AUTH_TAG_SIZE);
-	memzero_explicit(input, sizeof(input));
-}
-
 static void tcps_conn_derive(struct tcps_conn *c)
 {
 	uint8_t shared[TCPS_DH_SIZE];
@@ -872,8 +798,6 @@ static void tcps_conn_derive(struct tcps_conn *c)
 	memzero_explicit(mac_c2s, sizeof(mac_c2s));
 	memzero_explicit(mac_s2c, sizeof(mac_s2c));
 	memzero_explicit(c->dh_priv, sizeof(c->dh_priv));
-	memzero_explicit(c->dh_pub, sizeof(c->dh_pub));
-	memzero_explicit(c->dh_peer_pub, sizeof(c->dh_peer_pub));
 
 	c->state = TCPS_ENCRYPTED;
 
@@ -914,6 +838,13 @@ static unsigned int tcps_out(void *priv, struct sk_buff *skb,
 	if (th->syn && !th->ack) {
 		c = tcps_conn_add(iph->saddr, th->source,
 				  iph->daddr, th->dest);
+		if (!c) {
+			pr_warn_ratelimited("tcps: connection table full, dropping SYN %pI4:%u->%pI4:%u\n",
+					    &iph->saddr, ntohs(th->source),
+					    &iph->daddr, ntohs(th->dest));
+			rcu_read_unlock();
+			return NF_DROP;
+		}
 		if (c) {
 			spin_lock(&c->lock);
 			if (c->state != TCPS_NONE && c->state != TCPS_SYN_SENT) {
@@ -985,78 +916,66 @@ static unsigned int tcps_out(void *priv, struct sk_buff *skb,
 		if (payload_len < 0)
 			payload_len = 0;
 
-		if (!c->probe_sent && payload_len > 0) {
-			uint8_t probe[TCPS_PROBE_SIZE];
-
+		if (!c->probe_sent) {
 			if (c->is_client) {
-				probe[0] = TCPS_PROBE_REQ_MARKER;
-				probe[1] = TCPS_PROBE_MAGIC1;
-				probe[2] = TCPS_PROBE_MAGIC2;
-				probe[3] = TCPS_PROBE_REQ_MAGIC3;
-				memcpy(probe + 4, tcps_static_pub,
-				       TCPS_DH_SIZE);
-			} else if (c->probe_recv) {
+				c->probe_sent = 1;
+			} else if (c->probe_recv && payload_len > 0) {
+				uint8_t probe[TCPS_PROBE_SIZE];
+
 				probe[0] = TCPS_PROBE_RSP_MARKER;
 				probe[1] = TCPS_PROBE_MAGIC1;
 				probe[2] = TCPS_PROBE_MAGIC2;
 				probe[3] = TCPS_PROBE_RSP_MAGIC3;
 				memcpy(probe + 4, tcps_static_pub,
 				       TCPS_DH_SIZE);
-			} else {
-				if (th->fin)
-					c->fin_out = 1;
-				spin_unlock(&c->lock);
-				rcu_read_unlock();
-				return NF_ACCEPT;
-			}
 
-			if (skb_tailroom(skb) < TCPS_PROBE_SIZE) {
-				if (pskb_expand_head(skb, 0,
-					 TCPS_PROBE_SIZE -
-					 skb_tailroom(skb),
-					 GFP_ATOMIC)) {
+				if (skb_tailroom(skb) < TCPS_PROBE_SIZE) {
+					if (pskb_expand_head(skb, 0,
+						 TCPS_PROBE_SIZE -
+						 skb_tailroom(skb),
+						 GFP_ATOMIC)) {
+						spin_unlock(&c->lock);
+						rcu_read_unlock();
+						return NF_DROP;
+					}
+					iph = ip_hdr(skb);
+					th = tcp_hdr(skb);
+				}
+				skb_put(skb, TCPS_PROBE_SIZE);
+				if (skb_ensure_writable(skb, skb->len)) {
 					spin_unlock(&c->lock);
 					rcu_read_unlock();
 					return NF_DROP;
 				}
 				iph = ip_hdr(skb);
 				th = tcp_hdr(skb);
-			}
-			skb_put(skb, TCPS_PROBE_SIZE);
-			if (skb_ensure_writable(skb, skb->len)) {
-				spin_unlock(&c->lock);
-				rcu_read_unlock();
-				return NF_DROP;
-			}
-			iph = ip_hdr(skb);
-			th = tcp_hdr(skb);
 
-			payload = (uint8_t *)th + payload_off;
-			memmove(payload + TCPS_PROBE_SIZE, payload,
-				payload_len);
-			memcpy(payload, probe, TCPS_PROBE_SIZE);
+				payload = (uint8_t *)th + payload_off;
+				memmove(payload + TCPS_PROBE_SIZE, payload,
+					payload_len);
+				memcpy(payload, probe, TCPS_PROBE_SIZE);
 
-			iph->tot_len = htons(ntohs(iph->tot_len) +
-					     TCPS_PROBE_SIZE);
-			iph->check = 0;
-			iph->check = ip_fast_csum((unsigned char *)iph,
-						  iph->ihl);
-			{
-				int tl = ntohs(iph->tot_len) -
-					 iph->ihl * 4;
-				th->check = 0;
-				th->check = csum_tcpudp_magic(
-					iph->saddr, iph->daddr,
-					tl, IPPROTO_TCP,
-					csum_partial(th, tl, 0));
-				skb->ip_summed = CHECKSUM_NONE;
+				iph->tot_len = htons(ntohs(iph->tot_len) +
+						     TCPS_PROBE_SIZE);
+				iph->check = 0;
+				iph->check = ip_fast_csum(
+					(unsigned char *)iph, iph->ihl);
+				{
+					int tl = ntohs(iph->tot_len) -
+						 iph->ihl * 4;
+					th->check = 0;
+					th->check = csum_tcpudp_magic(
+						iph->saddr, iph->daddr,
+						tl, IPPROTO_TCP,
+						csum_partial(th, tl, 0));
+					skb->ip_summed = CHECKSUM_NONE;
+				}
+
+				c->probe_sent = 1;
+				pr_info("tcps: probe response sent %pI4:%u <-> %pI4:%u\n",
+					&c->saddr, ntohs(c->sport),
+					&c->daddr, ntohs(c->dport));
 			}
-
-			c->probe_sent = 1;
-			pr_info("tcps: probe %s %pI4:%u <-> %pI4:%u\n",
-				c->is_client ? "sent" : "response sent",
-				&c->saddr, ntohs(c->sport),
-				&c->daddr, ntohs(c->dport));
 		}
 
 		if (th->fin)
@@ -1076,6 +995,7 @@ static unsigned int tcps_out(void *priv, struct sk_buff *skb,
 	c->last_active = jiffies;
 
 	if (th->rst) {
+		c->kill = 1;
 		c->state = TCPS_DEAD;
 		spin_unlock(&c->lock);
 		rcu_read_unlock();
@@ -1090,30 +1010,16 @@ static unsigned int tcps_out(void *priv, struct sk_buff *skb,
 
 	if (c->state == TCPS_ENCRYPTED && !c->ti_recv &&
 	    !th->syn && !th->fin && payload_len == 0) {
-		uint8_t auth_tag[TCPS_AUTH_TAG_SIZE];
-
-		tcps_compute_send_auth_tag(c, auth_tag);
-
-		if (add_ti_option(skb, tcps_static_pub, auth_tag) != 0) {
-			pr_warn("tcps: failed to add TI option, dropping\n");
-			memzero_explicit(auth_tag, sizeof(auth_tag));
-			spin_unlock(&c->lock);
-			rcu_read_unlock();
-			return NF_DROP;
-		}
-		c->ti_sent = 1;
-		pr_info("tcps: TI option sent %pI4:%u <-> %pI4:%u\n",
-			&c->saddr, ntohs(c->sport),
-			&c->daddr, ntohs(c->dport));
-		memzero_explicit(auth_tag, sizeof(auth_tag));
-		iph = ip_hdr(skb);
-		th = tcp_hdr(skb);
+		spin_unlock(&c->lock);
+		rcu_read_unlock();
+		return NF_ACCEPT;
 	}
 
 	if (payload_len > 0 || th->fin) {
 		uint8_t tcp_flags = ((uint8_t *)th)[13];
-		int embed_ti = (c->state == TCPS_ENCRYPTED && !c->ti_sent &&
-				payload_len > 0);
+		int embed_ti = (!c->ti_sent && payload_len > 0 &&
+				(c->state == TCPS_ENCRYPTED ||
+				 c->state == TCPS_AUTHENTICATED));
 		uint8_t ti_prefix[TCPS_TI_EMBED_SIZE];
 		int ti_prefix_len = 0;
 
@@ -1178,18 +1084,19 @@ static unsigned int tcps_out(void *priv, struct sk_buff *skb,
 
 		pos = tcps_send_pos(c, ntohl(th->seq));
 
-		if (payload_len > 0) {
-			payload = (uint8_t *)th + payload_off + ti_prefix_len;
-			chacha20_xor_stream(c->enc_key, pos, payload,
-					    payload_len);
+		{
+			size_t total_enc_len = ti_prefix_len + payload_len;
+			uint8_t *enc_data = (uint8_t *)th + payload_off;
+
+			if (total_enc_len > 0)
+				chacha20_xor_stream(c->enc_key, pos, enc_data,
+						    total_enc_len);
 		}
 
 		if (ti_prefix_len > 0) {
-			tcps_compute_mac_prefix(c->mac_enc_key, pos, tcp_flags,
-						ti_prefix, ti_prefix_len,
-						(uint8_t *)th + payload_off +
-						ti_prefix_len,
-						payload_len, tag);
+			tcps_compute_mac(c->mac_enc_key, pos, tcp_flags,
+					 (uint8_t *)th + payload_off,
+					 ti_prefix_len + payload_len, tag);
 		} else {
 			tcps_compute_mac(c->mac_enc_key, pos, tcp_flags,
 					 payload_len > 0 ?
@@ -1252,12 +1159,7 @@ static unsigned int tcps_in(void *priv, struct sk_buff *skb,
 	struct tcps_conn *c;
 	int tcplen, payload_off, payload_len;
 	uint64_t pos;
-	uint8_t *payload;
 	uint8_t peer_pub[TCPS_DH_SIZE];
-	uint8_t recv_tag[TCPS_MAC_TAG_SIZE];
-	uint8_t calc_tag[TCPS_MAC_TAG_SIZE];
-	uint8_t ti_pub[TCPS_DH_SIZE];
-	uint8_t ti_tag[TCPS_AUTH_TAG_SIZE];
 	uint32_t peer_epoch;
 
 	if (!skb || skb->protocol != htons(ETH_P_IP))
@@ -1332,8 +1234,8 @@ static unsigned int tcps_in(void *priv, struct sk_buff *skb,
 					drop = 1;
 				} else {
 					c->server_isn = ntohl(th->seq);
-					pr_info("tcps: peer %pI4 has no TCPS module, probing\n",
-						&peer_addr);
+				pr_info("tcps: peer %pI4 has no TCPS module, plain TCP\n",
+					&peer_addr);
 					c->state = TCPS_PLAIN_PROBE;
 					drop = 0;
 				}
@@ -1361,7 +1263,6 @@ static unsigned int tcps_in(void *priv, struct sk_buff *skb,
 				    p[2] == TCPS_PROBE_MAGIC2 &&
 				    p[3] == TCPS_PROBE_REQ_MAGIC3) {
 					uint8_t client_pub[TCPS_DH_SIZE];
-					uint8_t zero_tag[TCPS_AUTH_TAG_SIZE];
 
 					memcpy(client_pub, p + 4,
 					       TCPS_DH_SIZE);
@@ -1418,12 +1319,7 @@ static unsigned int tcps_in(void *priv, struct sk_buff *skb,
 							CHECKSUM_NONE;
 					}
 
-					memset(zero_tag, 0,
-					       TCPS_AUTH_TAG_SIZE);
-					tcps_tofu_verify(iph->saddr,
-							 client_pub,
-							 zero_tag, 0, 0,
-							 0, 0);
+					tcps_tofu_register(iph->saddr, client_pub, 0);
 
 					pr_warn("tcps: probe received from %pI4:%u — TCPS option was stripped, possible MITM\n",
 						&iph->saddr,
@@ -1460,20 +1356,14 @@ static unsigned int tcps_in(void *priv, struct sk_buff *skb,
 				    p[2] == TCPS_PROBE_MAGIC2 &&
 				    p[3] == TCPS_PROBE_RSP_MAGIC3) {
 					uint8_t server_pub[TCPS_DH_SIZE];
-					uint8_t zero_tag[TCPS_AUTH_TAG_SIZE];
 
 					memcpy(server_pub, p + 4,
 					       TCPS_DH_SIZE);
 
+					tcps_tofu_register(c->daddr, server_pub, 0);
+
 					pr_warn("tcps: DOWNGRADE DETECTED! Peer %pI4 has TCPS module but option was stripped\n",
 						&c->daddr);
-
-					memset(zero_tag, 0,
-					       TCPS_AUTH_TAG_SIZE);
-					tcps_tofu_verify(c->daddr,
-							 server_pub,
-							 zero_tag, 0, 0,
-							 1, 0);
 
 					c->probe_recv = 1;
 					c->kill = 1;
@@ -1512,20 +1402,56 @@ static unsigned int tcps_in(void *priv, struct sk_buff *skb,
 	}
 
 	if (c->state == TCPS_ENCRYPTED && !c->ti_recv) {
+		uint8_t ti_pub[TCPS_DH_SIZE];
+		uint8_t ti_tag[TCPS_AUTH_TAG_SIZE];
 		if (tcp_option_find_ti(th, ti_pub, ti_tag)) {
 			__be32 peer_addr = c->is_client ? c->daddr : c->saddr;
-			int ret = tcps_tofu_verify(peer_addr, ti_pub, ti_tag,
-						   c->client_isn,
-						   c->server_isn,
-						   !c->is_client,
-						   c->peer_epoch);
-			if (ret < 0 && tcps_tofu_enforce) {
-				pr_warn("tcps: dropping packet from %pI4 - TOFU verification failed\n",
-					&peer_addr);
-				c->state = TCPS_DEAD;
+			const uint8_t *client_dh = c->is_client ? c->dh_pub : c->dh_peer_pub;
+			const uint8_t *server_dh = c->is_client ? c->dh_peer_pub : c->dh_pub;
+			uint8_t ti_recv_tag[TCPS_MAC_TAG_SIZE];
+			uint8_t ti_calc_tag[TCPS_MAC_TAG_SIZE];
+			uint64_t ti_pos;
+			uint8_t ti_tcp_flags = ((uint8_t *)th)[13];
+			uint32_t ti_saved_recv_wrap;
+			uint64_t ti_saved_max_recv_pos;
+
+			if (!tcp_option_find_mac(th, ti_recv_tag)) {
+				pr_warn("tcps: TI option without MAC, dropping\n");
 				spin_unlock(&c->lock);
 				rcu_read_unlock();
 				return NF_DROP;
+			}
+
+			ti_saved_recv_wrap = c->recv_wrap;
+			ti_saved_max_recv_pos = c->max_recv_pos;
+			ti_pos = tcps_recv_pos(c, ntohl(th->seq));
+			tcps_compute_mac(c->mac_dec_key, ti_pos, ti_tcp_flags, NULL, 0,
+					 ti_calc_tag);
+			if (crypto_memneq(ti_recv_tag, ti_calc_tag, TCPS_MAC_TAG_SIZE)) {
+				c->recv_wrap = ti_saved_recv_wrap;
+				c->max_recv_pos = ti_saved_max_recv_pos;
+				pr_warn("tcps: TI packet MAC verification failed, dropping\n");
+				spin_unlock(&c->lock);
+				rcu_read_unlock();
+				return NF_DROP;
+			}
+
+			{
+				int ret = tcps_tofu_verify(peer_addr, ti_pub, ti_tag,
+							   c->client_isn,
+							   c->server_isn,
+							   !c->is_client,
+							   c->peer_epoch,
+							   client_dh, server_dh);
+				if (ret < 0 && tcps_tofu_enforce) {
+					pr_warn("tcps: dropping packet from %pI4 - TOFU verification failed\n",
+						&peer_addr);
+					c->kill = 1;
+					c->state = TCPS_DEAD;
+					spin_unlock(&c->lock);
+					rcu_read_unlock();
+					return NF_DROP;
+				}
 			}
 			c->ti_recv = 1;
 			c->state = TCPS_AUTHENTICATED;
@@ -1543,35 +1469,96 @@ static unsigned int tcps_in(void *priv, struct sk_buff *skb,
 
 	if (payload_len > 0 || th->fin) {
 		uint8_t tcp_flags = ((uint8_t *)th)[13];
-		int embed_ti = (c->state == TCPS_ENCRYPTED && !c->ti_recv &&
-				payload_len > 0 &&
-				*(__be32 *)((uint8_t *)th + payload_off) ==
-					htonl(0x01000000));
+		uint32_t saved_recv_wrap;
+		uint64_t saved_max_recv_pos;
+		uint8_t recv_tag[TCPS_MAC_TAG_SIZE];
+		uint8_t calc_tag[TCPS_MAC_TAG_SIZE];
 
 		if (!tcp_option_find_mac(th, recv_tag)) {
+			if (payload_len >= TCPS_PROBE_SIZE &&
+			    !c->is_client && !c->probe_recv) {
+				uint8_t *p = (uint8_t *)th + payload_off;
+				if (p[0] == TCPS_PROBE_REQ_MARKER &&
+				    p[1] == TCPS_PROBE_MAGIC1 &&
+				    p[2] == TCPS_PROBE_MAGIC2 &&
+				    p[3] == TCPS_PROBE_REQ_MAGIC3) {
+					uint8_t client_pub[TCPS_DH_SIZE];
+					int app_len = payload_len -
+						      TCPS_PROBE_SIZE;
+
+					memcpy(client_pub, p + 4,
+					       TCPS_DH_SIZE);
+					tcps_tofu_register(
+						iph->saddr, client_pub, 0);
+					pr_warn("tcps: probe from %pI4 while ENCRYPTED — SYN+ACK was stripped, demoting to PLAIN_PROBE\n",
+						&iph->saddr);
+					c->state = TCPS_PLAIN_PROBE;
+					c->probe_recv = 1;
+
+					if (app_len > 0) {
+						memmove(
+						 (uint8_t *)th +
+						 payload_off,
+						 (uint8_t *)th +
+						 payload_off +
+						 TCPS_PROBE_SIZE,
+						 app_len);
+					}
+					skb_trim(skb,
+						 skb->len -
+						 TCPS_PROBE_SIZE);
+					iph = ip_hdr(skb);
+					th = tcp_hdr(skb);
+					iph->tot_len = htons(
+					 ntohs(iph->tot_len) -
+					 TCPS_PROBE_SIZE);
+					iph->check = 0;
+					iph->check = ip_fast_csum(
+					 (unsigned char *)iph,
+					 iph->ihl);
+					tcplen = ntohs(iph->tot_len) -
+						 iph->ihl * 4;
+					th->check = 0;
+					th->check =
+					 csum_tcpudp_magic(
+					  iph->saddr, iph->daddr,
+					  tcplen, IPPROTO_TCP,
+					  csum_partial(th, tcplen,
+						       0));
+					skb->ip_summed =
+					 CHECKSUM_NONE;
+
+					spin_unlock(&c->lock);
+					rcu_read_unlock();
+					return NF_ACCEPT;
+				}
+			}
+			if (!c->is_client) {
+				pr_warn("tcps: data without MAC from %pI4 while ENCRYPTED — possible MITM (SYN+ACK stripped)\n",
+					&iph->saddr);
+			}
 			pr_warn("tcps: no MAC option, dropping\n");
 			spin_unlock(&c->lock);
 			rcu_read_unlock();
 			return NF_DROP;
 		}
 
+		saved_recv_wrap = c->recv_wrap;
+		saved_max_recv_pos = c->max_recv_pos;
 		pos = tcps_recv_pos(c, ntohl(th->seq));
 
-		if (embed_ti && payload_len >= TCPS_TI_EMBED_SIZE) {
-			uint8_t *ti_p = (uint8_t *)th + payload_off;
-			tcps_compute_mac_prefix(c->mac_dec_key, pos, tcp_flags,
-						ti_p, TCPS_TI_EMBED_SIZE,
-						ti_p + TCPS_TI_EMBED_SIZE,
-						payload_len - TCPS_TI_EMBED_SIZE,
-						calc_tag);
+		if (payload_len > 0) {
+			tcps_compute_mac(c->mac_dec_key, pos, tcp_flags,
+					 (uint8_t *)th + payload_off,
+					 payload_len, calc_tag);
 		} else {
 			tcps_compute_mac(c->mac_dec_key, pos, tcp_flags,
-					 payload_len > 0 ?
-						(uint8_t *)th + payload_off : NULL,
-					 payload_len, calc_tag);
+					 NULL, 0, calc_tag);
 		}
 
 		if (crypto_memneq(recv_tag, calc_tag, TCPS_MAC_TAG_SIZE)) {
+			c->recv_wrap = saved_recv_wrap;
+			c->max_recv_pos = saved_max_recv_pos;
 			pr_warn("tcps: MAC verification failed, dropping\n");
 			spin_unlock(&c->lock);
 			rcu_read_unlock();
@@ -1579,72 +1566,82 @@ static unsigned int tcps_in(void *priv, struct sk_buff *skb,
 		}
 
 		if (payload_len > 0) {
-			int dec_off = (embed_ti &&
-				       payload_len >= TCPS_TI_EMBED_SIZE) ?
-				      TCPS_TI_EMBED_SIZE : 0;
-			payload = (uint8_t *)th + payload_off + dec_off;
-			chacha20_xor_stream(c->dec_key, pos, payload,
-					    payload_len - dec_off);
+			chacha20_xor_stream(c->dec_key, pos,
+					    (uint8_t *)th + payload_off,
+					    payload_len);
 		}
 
-		if (embed_ti && payload_len >= TCPS_TI_EMBED_SIZE) {
-			uint8_t *ti_p = (uint8_t *)th + payload_off;
-			__be32 peer_addr = c->is_client ? c->daddr : c->saddr;
-			int app_len = payload_len - TCPS_TI_EMBED_SIZE;
+		{
+			int embed_ti = (c->state == TCPS_ENCRYPTED && !c->ti_recv &&
+					payload_len >= TCPS_TI_EMBED_SIZE &&
+					*((uint8_t *)th + payload_off) ==
+						TCPS_TI_EMBED_MARKER);
 
-			memcpy(ti_pub, ti_p + 1, TCPS_DH_SIZE);
-			memcpy(ti_tag, ti_p + 1 + TCPS_DH_SIZE,
-			       TCPS_AUTH_TAG_SIZE);
+			if (embed_ti) {
+				uint8_t ti_pub[TCPS_DH_SIZE];
+				uint8_t ti_tag[TCPS_AUTH_TAG_SIZE];
+				uint8_t *ti_p = (uint8_t *)th + payload_off;
+				__be32 peer_addr = c->is_client ? c->daddr : c->saddr;
+				const uint8_t *client_dh = c->is_client ? c->dh_pub : c->dh_peer_pub;
+				const uint8_t *server_dh = c->is_client ? c->dh_peer_pub : c->dh_pub;
+				int app_len = payload_len - TCPS_TI_EMBED_SIZE;
 
-			{
-				int ret = tcps_tofu_verify(peer_addr, ti_pub,
-							   ti_tag,
-							   c->client_isn,
-							   c->server_isn,
-							   !c->is_client,
-							   c->peer_epoch);
-				if (ret < 0 && tcps_tofu_enforce) {
-					pr_warn("tcps: embedded TI TOFU failed for %pI4\n",
-						&peer_addr);
-					c->state = TCPS_DEAD;
-					spin_unlock(&c->lock);
-					rcu_read_unlock();
-					return NF_DROP;
+				memcpy(ti_pub, ti_p + 1, TCPS_DH_SIZE);
+				memcpy(ti_tag, ti_p + 1 + TCPS_DH_SIZE,
+				       TCPS_AUTH_TAG_SIZE);
+
+				{
+					int ret = tcps_tofu_verify(peer_addr, ti_pub,
+								   ti_tag,
+								   c->client_isn,
+								   c->server_isn,
+								   !c->is_client,
+								   c->peer_epoch,
+								   client_dh, server_dh);
+					if (ret < 0 && tcps_tofu_enforce) {
+						pr_warn("tcps: embedded TI TOFU failed for %pI4\n",
+							&peer_addr);
+						c->kill = 1;
+						c->state = TCPS_DEAD;
+						spin_unlock(&c->lock);
+						rcu_read_unlock();
+						return NF_DROP;
+					}
 				}
-			}
-			c->ti_recv = 1;
-			c->state = TCPS_AUTHENTICATED;
-			pr_info("tcps: session authenticated (embedded TI) %pI4:%u <-> %pI4:%u\n",
-				&c->saddr, ntohs(c->sport),
-				&c->daddr, ntohs(c->dport));
+				c->ti_recv = 1;
+				c->state = TCPS_AUTHENTICATED;
+				pr_info("tcps: session authenticated (embedded TI) %pI4:%u <-> %pI4:%u\n",
+					&c->saddr, ntohs(c->sport),
+					&c->daddr, ntohs(c->dport));
 
-			if (app_len > 0) {
-				memmove((uint8_t *)th + payload_off,
-					(uint8_t *)th + payload_off +
-					TCPS_TI_EMBED_SIZE,
-					app_len);
+				if (app_len > 0) {
+					memmove((uint8_t *)th + payload_off,
+						(uint8_t *)th + payload_off +
+						TCPS_TI_EMBED_SIZE,
+						app_len);
+				}
+				skb_trim(skb, skb->len - TCPS_TI_EMBED_SIZE);
+				iph = ip_hdr(skb);
+				th = tcp_hdr(skb);
+				iph->tot_len = htons(ntohs(iph->tot_len) -
+						     TCPS_TI_EMBED_SIZE);
+				iph->check = 0;
+				iph->check = ip_fast_csum((unsigned char *)iph,
+							  iph->ihl);
+				tcplen = ntohs(iph->tot_len) - iph->ihl * 4;
+				th->check = 0;
+				th->check = csum_tcpudp_magic(
+					iph->saddr, iph->daddr,
+					tcplen, IPPROTO_TCP,
+					csum_partial(th, tcplen, 0));
+				skb->ip_summed = CHECKSUM_NONE;
+			} else if (payload_len > 0) {
+				th->check = 0;
+				th->check = csum_tcpudp_magic(iph->saddr, iph->daddr,
+							      tcplen, IPPROTO_TCP,
+							      csum_partial(th, tcplen, 0));
+				skb->ip_summed = CHECKSUM_NONE;
 			}
-			skb_trim(skb, skb->len - TCPS_TI_EMBED_SIZE);
-			iph = ip_hdr(skb);
-			th = tcp_hdr(skb);
-			iph->tot_len = htons(ntohs(iph->tot_len) -
-					     TCPS_TI_EMBED_SIZE);
-			iph->check = 0;
-			iph->check = ip_fast_csum((unsigned char *)iph,
-						  iph->ihl);
-			tcplen = ntohs(iph->tot_len) - iph->ihl * 4;
-			th->check = 0;
-			th->check = csum_tcpudp_magic(
-				iph->saddr, iph->daddr,
-				tcplen, IPPROTO_TCP,
-				csum_partial(th, tcplen, 0));
-			skb->ip_summed = CHECKSUM_NONE;
-		} else if (payload_len > 0) {
-			th->check = 0;
-			th->check = csum_tcpudp_magic(iph->saddr, iph->daddr,
-						      tcplen, IPPROTO_TCP,
-						      csum_partial(th, tcplen, 0));
-			skb->ip_summed = CHECKSUM_NONE;
 		}
 	}
 
@@ -1690,22 +1687,36 @@ static void tcps_compute_send_auth_tag(struct tcps_conn *c,
 	struct tcps_peer_entry *pe;
 	uint32_t ph = jhash_1word(
 		(__force u32)(c->is_client ? c->daddr : c->saddr), 0);
+	__be32 peer_addr = c->is_client ? c->daddr : c->saddr;
+	uint8_t saved_pub[TCPS_DH_SIZE];
+	const uint8_t *client_dh, *server_dh;
 
 	memset(auth_tag, 0, TCPS_AUTH_TAG_SIZE);
-	hash_for_each_possible_rcu(tcps_peers_table, pe, hnode, ph) {
-		__be32 peer_addr = c->is_client ? c->daddr : c->saddr;
+
+	spin_lock(&tcps_peers_lock);
+	hash_for_each_possible(tcps_peers_table, pe, hnode, ph) {
 		if (pe->addr == peer_addr) {
-			uint8_t shared[TCPS_DH_SIZE];
-			if (tcps_dh_shared(tcps_static_priv, pe->pubkey,
-					   shared) == 0) {
-				tcps_compute_auth_tag(shared, c->client_isn,
-						      c->server_isn,
-						      c->is_client, auth_tag);
+			memcpy(saved_pub, pe->pubkey, TCPS_DH_SIZE);
+			spin_unlock(&tcps_peers_lock);
+			{
+				uint8_t shared[TCPS_DH_SIZE];
+				if (tcps_dh_shared(tcps_static_priv, saved_pub,
+						   shared) == 0) {
+					client_dh = c->is_client ? c->dh_pub : c->dh_peer_pub;
+					server_dh = c->is_client ? c->dh_peer_pub : c->dh_pub;
+					tcps_compute_auth_tag(shared, client_dh,
+							      server_dh,
+							      c->client_isn,
+							      c->server_isn,
+							      c->is_client, auth_tag);
+				}
+				memzero_explicit(shared, sizeof(shared));
 			}
-			memzero_explicit(shared, sizeof(shared));
-			break;
+			memzero_explicit(saved_pub, sizeof(saved_pub));
+			return;
 		}
 	}
+	spin_unlock(&tcps_peers_lock);
 }
 
 static int __init tcps_init(void)
@@ -1734,6 +1745,7 @@ static void __exit tcps_exit(void)
 {
 	cancel_delayed_work_sync(&tcps_gc_work);
 	nf_unregister_net_hooks(&init_net, tcps_ops, ARRAY_SIZE(tcps_ops));
+	rcu_barrier();
 	tcps_keyring_save();
 	tcps_conn_cleanup();
 	tcps_tofu_cleanup();

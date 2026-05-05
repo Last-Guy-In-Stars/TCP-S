@@ -99,12 +99,15 @@ void chacha20_xor_stream(const uint8_t key[32], uint64_t pos,
 		state[12]++;
 		if (!state[12])
 			state[13]++;
-		chunk = len - off;
-		if (chunk > 64)
-			chunk = 64;
-		for (j = 0; j < chunk; j++)
-			data[off++] ^= ks[j];
+	chunk = len - off;
+	if (chunk > 64)
+		chunk = 64;
+	for (j = 0; j < chunk; j++)
+		data[off++] ^= ks[j];
 	}
+
+	memzero_explicit(state, sizeof(state));
+	memzero_explicit(ks, sizeof(ks));
 }
 
 void tcps_dh_keygen(uint8_t priv[TCPS_DH_SIZE], uint8_t pub[TCPS_DH_SIZE])
@@ -330,7 +333,7 @@ void tcps_compute_mac_prefix(const uint8_t mac_key[TCPS_KEY_SIZE],
 	}
 
 	memset(pad, 0, 16);
-	store_le64(pad, 8);
+	store_le64(pad, 9);
 	store_le64(pad + 8, total_len);
 	poly1305_block(&ctx, pad, 1);
 
@@ -339,4 +342,64 @@ void tcps_compute_mac_prefix(const uint8_t mac_key[TCPS_KEY_SIZE],
 
 	memzero_explicit(poly_key, sizeof(poly_key));
 	memzero_explicit(full_tag, sizeof(full_tag));
+	memzero_explicit(&ctx, sizeof(ctx));
+}
+
+void tcps_compute_auth_tag(const uint8_t shared_static[TCPS_DH_SIZE],
+			   const uint8_t client_dh[TCPS_DH_SIZE],
+			   const uint8_t server_dh[TCPS_DH_SIZE],
+			   uint32_t client_isn, uint32_t server_isn,
+			   int is_client,
+			   uint8_t tag[TCPS_AUTH_TAG_SIZE])
+{
+	uint8_t poly_key[32];
+	uint8_t full_tag[16];
+	uint8_t buf[16];
+	struct poly1305_ctx ctx;
+	size_t i;
+	size_t n;
+
+	memset(poly_key, 0, 32);
+	chacha20_xor_stream(shared_static, (3ULL << 62), poly_key, 32);
+	poly1305_init(&ctx, poly_key);
+
+	memset(buf, 0, 16);
+	store_le32(buf, client_isn);
+	store_le32(buf + 4, server_isn);
+	buf[8] = is_client ? 1 : 0;
+	buf[9] = 0x01;
+	poly1305_block(&ctx, buf, 0);
+
+	for (i = 0; i + 16 <= TCPS_DH_SIZE; i += 16)
+		poly1305_block(&ctx, client_dh + i, 1);
+	n = TCPS_DH_SIZE - i;
+	if (n > 0) {
+		memset(buf, 0, 16);
+		memcpy(buf, client_dh + i, n);
+		buf[n] = 0x01;
+		poly1305_block(&ctx, buf, 0);
+	}
+
+	for (i = 0; i + 16 <= TCPS_DH_SIZE; i += 16)
+		poly1305_block(&ctx, server_dh + i, 1);
+	n = TCPS_DH_SIZE - i;
+	if (n > 0) {
+		memset(buf, 0, 16);
+		memcpy(buf, server_dh + i, n);
+		buf[n] = 0x01;
+		poly1305_block(&ctx, buf, 0);
+	}
+
+	memset(buf, 0, 16);
+	store_le64(buf, 9);
+	store_le64(buf + 8, (uint64_t)TCPS_DH_SIZE * 2);
+	poly1305_block(&ctx, buf, 1);
+
+	poly1305_finish(&ctx, full_tag);
+	memcpy(tag, full_tag, TCPS_AUTH_TAG_SIZE);
+
+	memzero_explicit(poly_key, sizeof(poly_key));
+	memzero_explicit(full_tag, sizeof(full_tag));
+	memzero_explicit(buf, sizeof(buf));
+	memzero_explicit(&ctx, sizeof(ctx));
 }
