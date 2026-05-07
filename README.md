@@ -17,19 +17,19 @@ tcps/
 ## Kernel module (tcps.ko)
 
 1. Netfilter hook LOCAL_OUT — adds TCP option **TC** (kind=253, len=4, magic=0x5443) to SYN
-2. Netfilter hook PRE_ROUTING — detects TC option in SYN → creates a connection entry
-3. SYN-ACK too carries the TC option — both hosts have confirmed TCPS support
-4. After handshake — **PSK** (derived from init-key exchange) → KDF → 4 directional keys (enc_c2s, enc_s2c, mac_c2s, mac_s2c)
-5. All TCP data is encrypted with **ChaCha20** (stream cipher, XOR on the stream position, packet size does not change)
-6. Each data packet is signed with **Poly1305 MAC** (TM option, kind=253, len=8, tag=4 bytes)
-7. Works for all TCP sockets on the system, applications are unaware of this
-8. Ports from `skip_ports` (default 22) are skipped — SSH/SCP work without modification
-9. Loopback connections (127.x.x.x) are skipped
-10. GSO packets are skipped entirely (unable to authenticate without a tag in each segment)
+2. Netfilter hook PRE_ROUTING — detects the TC option in SYN → creates a connection record
+3. SYN-ACK also carries the TC option — both hosts have confirmed TCPS support
+4. After handshake — **PSK** (derived from init-key exchange) → KDF → 4 forwarded keys (enc_c2s, enc_s2c, mac_c2s, mac_s2c)
+5. All TCP data is encrypted with ChaCha20 (stream cipher, XOR on the stream position, packet size does not change)
+6. Each data packet is signed with Poly1305 MAC (TM option, kind=253, len=8, tag=4 bytes)
+7. Works for all TCP sockets on the system, applications are unaware of this.
+8. Ports from skip_ports (default 22) are skipped - SSH/SCP work without modification.
+9. Loopback connections (127.x.x.x) are skipped.
+10. GSO packets are skipped entirely (authentication is impossible without a tag in each segment).
 
-# Init-key exchange — key exchange protocol
+# Init-key exchange - key exchange protocol
 
-Each node generates **init_key** (random 32B) at boot → **pub_key** = curve25519(init_key, base).
+Each node generates init_key (random 32B) at boot → pub_key = curve25519(init_key, base).
 
 **TOFU unicast discovery (port 54321):**
 
@@ -37,38 +37,38 @@ Peer discovery no longer uses broadcast. Instead:
 
 1. SYN with TC option triggers unicast DISCOVER on the peer's IP (via workqueue)
 2. A background thread sends DISCOVER to peers without a PSK (from the TOFU table)
-3. During key rotation, unicast DISCOVER to all peers in TOFU (sending DISCOVER instead of KEYXCHG ensures DH consistency — both sides use the current pubkey from packets)
+3. During key rotation, unicast DISCOVER to all peers in TOFU (sending DISCOVER instead of KEYXCHG ensures DH consistency—both sides use the current pubkey from packets)
 
 ```
 Node A (sends SYN) Node B (receives SYN with TC)
-| | 
-| SYN + TC option ──────────────► | tcps_in sees TC → tcps_trigger_discover(A) 
+| |
+| SYN + TC option ────────────────► | tcps_in sees TC → tcps_trigger_discover(A) 
 | | 
 |◄── DISCOVER(pub_A) ──────────── | unicast, type=0x01 (from workqueue) 
 | | 
 |── KEYXCHG(pub_B, enc(init_B)) ► | unicast, type=0x02 
 | enc = ChaCha20(DH(init_B, pub_A), init_B) 
 | | 
-|◄── KEYXCHG(pub_A, enc(init_A))─ | unicast
-| enc = ChaCha20(DH(init_A, pub_B), init_A)
+|◄── KEYXCHG(pub_A, enc(init_A))─ | unicast 
+| enc = ChaCha20(DH(init_A, pub_B), init_A) 
 | |
 | PSK = KDF(DH_shared, init_A, init_B) — identical on both sides
 ```
 
 **DH consistency during rotation:**
 
-When both nodes rotate keys simultaneously, the DH shared keys may not match (the sender uses the peer's old pubkey from TOFU, and the recipient uses the sender's new pubkey from the packet). Solution:
+When both nodes rotate keys simultaneously, the DH shared key may not match (the sender uses the peer's old pubkey from TOFU, and the receiver uses the sender's new pubkey from the packet). Solution:
 
-1. During rotation, DISCOVER (not KEYXCHG) is sent → the receiver replies with KEYXCHG with the current pubkey.
+1. During rotation, DISCOVER (not KEYXCHG) is sent → the receiver responds with KEYXCHG with the current pubkey.
 2. The receiver attempts to decrypt the init_key with the current and previous init_keys (prev_init_key is preserved during rotation).
-3. Check: `curve25519(decrypted_init) == pkt.pubkey` - if it matches, the DH shared key is valid.
+3. Check: `curve25519(decrypted_init) == pkt.pubkey` — if it matches, the DH shared key is correct.
 4. This guarantees DH consistency even during simultaneous rotation.
 ```
 
 **Packet format:**
 
-| Type | Size | Content |
-|-----|---------|----------|
+| Type | Size | Contents |
+|----------|--------|-----------|
 | DISCOVER (0x01) | 37B | magic(4) + type(1) + pub_key(32) |
 | KEYXCHG (0x02) | 69B | magic(4) + type(1) + pub_key(32) + enc_init_key(32) |
 | KEYXCHG_AUTH (0x03) | 73B | magic(4) + type(1) + pub_key(32) + enc_init_key(32) + auth_tag(4) |
@@ -98,7 +98,7 @@ Each encrypted data packet contains a TM TCP option with a 4-byte Poly1305 tag:
 **MAC is calculated:**
 - Poly1305 one-time key = ChaCha20(mac_key, pos+32, zeros, 32) — offset +32 from the encryption position
 - AAD = flags(1) + seq(4), padded to 16 bytes
-- Login: AAD || encrypted_payload(padded to 16) || len(aad)_le64 || len(payload)_le64
+- Input: AAD || encrypted_payload(padded to 16) || len(aad)_le64 || len(payload)_le64
 - Tag is truncated to 4 bytes (2^32 forgery resistance)
 - Tag comparison — constant-time (`tcps_ct_memcmp`), protection against timing attacks
 
@@ -109,12 +109,12 @@ Each encrypted data packet contains a TM TCP option with a 4-byte Poly1305 tag:
 - `mac_dec_key` (smac) — incoming MAC
 
 **Behavior:**
-- TM option is NOT removed upon reception — TCP stack ignores unknown kind=253
-- GSO packets are passed entirely (without encryption and MAC) — segments cannot be authenticated
-- RST without MAC in KEYED state → DROP (protection against injection)
+- TM option is NOT removed upon reception - TCP stack ignores unknown kind=253
+- GSO packets are passed entirely (without encryption or MAC) - segments cannot be authenticated
+- RST without MAC in KEYED state → DROP (injection protection)
 - Data without MAC after `peer_has_mac` → DROP (bit-flipping protection)
 
-# KEYXCHG_AUTH — key rotation authentication
+# KEYXCHG_AUTH — Key rotation authentication
 
 When rotating the init-key, the module sends KEYXCHG_AUTH instead of KEYXCHG:
 
@@ -124,27 +124,27 @@ auth_tag = Poly1305(prev_psk, 0, type+pubkey+enc_init, 65, NULL, 0) [4 bytes]
 ```
 
 **Downgrade protection:**
-- The recipient checks the auth_tag with prev_psk (constant-time comparison)
-- If the tag matches → KEYXCHG_AUTH verified (rotation is legitimate)
-- If the tag does not match → WARN, continue as plain KEYXCHG (prev_psk) desynchronized during simultaneous rotation)
-- If KEYXCHG without AUTH, but we have prev_psk → WARN (peer reload?)
+- The recipient checks the auth_tag against prev_psk (constant-time comparison)
+- If the tag matches, → KEYXCHG_AUTH verified (rotation is legitimate)
+- If the tag does not match, → WARN, continue as plain KEYXCHG (prev_psk is out of sync during simultaneous rotation)
+- If KEYXCHG does not have AUTH, but we have prev_psk, → WARN (peer reload?)
 - If KEYXCHG_AUTH without prev_psk → WARN, accept as plain KEYXCHG
 
-# Forward secrecy (init-key rotation)
+# Forward Secrecy (init-key rotation)
 
 Every 3600 seconds (TCPS_KEY_ROTATE_INTERVAL):
 1. A new init_key / pub_key pair is generated
 2. The old PSK is stored as prev_psk (for KEYXCHG_AUTH)
-3. Unicast DISCOVER is sent to all peers from the TOFU table → peers respond with KEYXCHG with the current pubkey (DH consistency)
+3. Unicast DISCOVER is sent to all peers in the TOFU table → peers respond with KEYXCHG with the current pubkey (DH consistency)
 4. The old init_key is stored as prev_init_key (for DH retry when decrypting KEYXCHG)
-5. New connections use the new one PSK
-6. Existing connections continue using old keys.
+5. New connections use the new PSK
+6. Existing connections continue with the old keys
 
 # Out-of-band PSK verification (MITM protection)
 
-**Problem:** A MITM attack can substitute public keys in a UDP exchange → both nodes receive different PSKs → The MITM attack can decrypt both sides.
+**Problem:** MITM can spoof public keys Keys in UDP exchange → both nodes will receive different PSKs → MITM can decrypt both sides.
 
-**Solution:** The PSK fingerprint is the first 8 bytes of the PSK, shown on both sides. The operator compares:
+**Solution:** PSK fingerprint — the first 8 bytes of the PSK, shown on both sides. The operator compares:
 
 ```bash
 # On node A:
@@ -159,7 +159,7 @@ cat /proc/tcps_peers
 # Verify (if fingerprint matches):
 echo "verify 192.168.1.42 02f9b20aad44590b" > /proc/tcps_peers
 
-# If NOT matched → MITM! Do not verify.
+# If NOT a match → MITM! Do not verify.
 ```
 
 **Parameter `psk_require_verify`:**
@@ -169,7 +169,7 @@ echo "verify 192.168.1.42 02f9b20aad44590b" > /proc/tcps_peers
 | `psk_require_verify=0` (default) | Full PSK immediately | Full PSK |
 | `psk_require_verify=1` | DH fallback (weaker) | Full PSK |
 
-When `psk_require_verify=1`: connections to unverified peers use DH fallback (without init_key). After manual verification, the full PSK is used.
+When `psk_require_verify=1`: connections to unverified peers use DH fallback (without init_key). After manual verification, full PSK is used.
 
 # MITM Protection (TOFU + PSK verify + KEYXCHG_AUTH)
 
@@ -207,19 +207,19 @@ When `psk_require_verify=1`: connections to unverified peers use DH fallback (wi
 | `strict_tofu` | 0 | 0=update key with warning, 1=block on change |
 | `psk_require_verify` | 0 | 0=PSK immediately, 1=require verify before full PSK |
 | `rotate_interval` | 3600 | Init-key rotation interval in seconds |
+| `key_file` | (empty) | File to store the init-key (empty = RAM only, e.g. /etc/tcps/init_key) |
 
 ```bash
-insmod tcps.ko skip_ports=22,443 strict_tofu=1 psk_require_verify=1
+insmod tcps.ko skip_ports=22,443 strict_tofu=1 psk_require_verify=1 key_file=/etc/tcps/init_key
 cat /sys/module/tcps/parameters/psk_require_verify
 echo 1 > /sys/module/tcps/parameters/psk_require_verify
 ```
 
 # Probe option — detect TCPS support
 
-TCP option kind=253 (experimental range, RFC 4727, mid)
-Middleboxes are stripped less frequently).
+TCP option kind=253 (experimental range according to RFC 4727; middleboxes are stripped less frequently).
 
-| Field | Value | Description |
+| Field | Value |Description |
 |------|----------|----------|
 | Kind | 253 | Experimental (RFC 4727) |
 | Length | 4 | Option length |
@@ -285,18 +285,21 @@ Step | Node A (rotated) | MITM | Node B
 # Reloading the module (reload)
 
 With `rmmod` + `insmod`:
-1. A **new** init_key + pub_key is generated
-2. The connection table is cleared
-3. The TOFU cache is cleared, the PSK is lost
-4. A new SYN triggers unicast DISCOVER → the PSK is recalculated
-5. The PSK must be verified again (with `psk_require_verify=1`)
+1. Init_key **by default only in RAM** (no file on disk)
+2. On boot - if `key_file` is not set → a new init_key is generated (forward secrecy with rmmod)
+3. On boot - if `key_file=/etc/tcps/init_key` → loaded from file → **same pubkey** → TOFU/PSK preserved
+4. Key file - permissions 0600, root-only (similar to ~/.ssh/id_rsa)
+5. Connection table is cleared with rmmod (existing TCP sessions are broken)
+6. TOFU cache and PSK are preserved with key_file (pubkey is not (varies)
+
+**Recommendation:** Use `key_file=` for servers (TOFU consistency), without it - for workstations (maximum forward secrecy)
 
 **Impact on connections:**
 
 | Stage | SSH (port 22) | Other TCP |
 |------|--------------|------------|
 | Module loaded | OK (skip) | Encrypted (PSK + MAC) |
-| `rmmod` | OK (without module) | Existing ones are broken |
+| `rmmod` | OK (no module) | Existing keys are broken |
 | `insmod` (before discovery) | OK | New - weak keys (no peer) |
 | After DISCOVER + KEYXCHG | OK | New - DH fallback (before verify) |
 | After verify | OK | New - full PSK |
@@ -316,71 +319,71 @@ With `rmmod` + `insmod`:
 - Input: AAD || payload(padded) || len(aad)_le64 || len(payload)_le64
 - Tag comparison — constant-time (`tcps_ct_memcmp`)
 - **PSK derivation** — `KDF = ChaCha20_KDF(DH_shared, "TCPS-PSK" || init_key_A || init_key_B)`
-- DH_shared ensures consistency (both sides compute identically)
+- DH_shared ensures consistency (both sides compute the sameo)
 - Init keys add additional entropy (defense-in-depth)
-- The order of the init_key is determined by the public key (deterministically)
-- Domain label "TCPS-PSK" separates the PSK from other KDF positions
+- The order of init_key is determined by the public key (deterministically)
+- The domain label "TCPS-PSK" separates the PSK from other KDF positions
 - **DH fallback PSK** — `KDF = ChaCha20_KDF(DH_shared, "TCPS-FB")` — separate position, domain-separated
 - **Per-connection KDF** — `KDF(PSK, client_ISN, server_ISN)` → 4 keys
-- `TCPS c2s` (position 0x8000000000000000) — enc_key
-- `TCPS s2c` (position 0x8000000000000040) — dec_key
-- `TCPS cmac` (position 0x8000000000000080) — mac_enc_key
-- `TCPS smac` (position 0x800000000000000C0) — mac_dec_key
-- KDF label is limited to 31 bytes (overflow protection)
-- Stream position is calculated from ISN + 1 — unique for each connection
-- Private keys are destroyed via `memzero_explicit` when the module is unloaded
+- `TCPS c2s` (position 0x80000000000000000) — enc_key
+- `TCPS s2c` (position 0x80000000000000040) — dec_key
+- `TCPS cmac` (position 0x80000000000000080) — mac_enc_key
+- `TCPS smac` (position 0x80000000000000C0) — mac_dec_key
+- KDF label limited to 31 bytes (overflow protection)
+- Stream position calculated from ISN + 1 — unique for each connection
+- Private keys are destroyed via `memzero_explicit` when module unloads
 
-# Security Audit (Fixed)
+# Security Audit (fixed)
 
-A logic and vulnerability audit was conducted. Fixes by category:
+A logic and vulnerability audit was performed. Fixes by category:
 
 ## CRITICAL (5 fixes)
 
 | # | Vulnerability | Fix |
-|---|-----------|-------------|
+|---|-----------|------------|
 | C-1 | Poly1305: broken carry (`uint32` overflow instead of limb overflow) + modulus `2^128-5` instead of `2^130-5` | Carry via `>> 26`, reduction `h4 + (g3>>26) - (1<<24)`, sign-bit mask `(int32_t)g4 >> 31` |
 | C-2 | `memcmp` timing side-channel on MAC tag (~1024 attempts to forge) | `tcps_ct_memcmp()` — constant-time XOR accumulation |
-| C-3 | MAC truncated to 4 bytes (32-bit security) | Retained 4B due to TCP option space limitations; mitigated constant-time compare |
+| C-3 | MAC truncated to 4 bytes (32-bit security) | Left 4B due to TCP option space limitation; mitigated constant-time compare |
 | C-4 | `kfree` on `rcu_head` offset → frees invalid address | `tcps_peer_free_rcu()` with `container_of` + `memzero_explicit` |
-| C-5 | Zero PSK on DH error → zero-key encryption | All-zero DH shared check; fallback via `tcps_derive_psk_fallback()` with a separate position |
+| C-5 | Zero PSK on DH error → zero-key encryption | All-zero DH shared secret verification; fallback via `tcps_derive_psk_fallback()` with a separate position |
 
 ## HIGH (8 fixes)
 
 | # | Vulnerability | Fix |
 |---|-----------|-------------|
 | H-1 | PSK is read without locking (torn read during rotation) | `spin_lock(&tcps_peers_lock)` in `tcps_peer_get_psk()` |
-| H-2 | No all-zero DH shared secret check (low-order point attack) | `tcps_dh_shared()` returns -EINVAL for all-zero |
-| H-3 | GSO packets are encrypted without MAC (bit-flipping) | GSO packets are skipped completely (NF_ACCEPT without encryption) |
+| H-2 | No all-zero DH shared secret verification (low-order point attack) | `tcps_dh_shared()` returns -EINVAL for all-zero |
+| H-3 | GSO packets are encrypted without MAC (bit-flipping) | GSO packets are completely skipped (NF_ACCEPT without encryption) |
 | H-4 | `spin_lock` instead of `spin_lock_bh` in `tcps_in` → deadlock | All locks in `tcps_in` → `spin_lock_bh` |
 | H-5 | Duplicate connections during SYN retransmit (memory leak) | `tcps_conn_add_unique()` — lookup before add |
 | H-6 | 4GB seq wrap → keystream reuse (two-time pad) | `enc_seq_hi`/`dec_seq_hi` track 32-bit wrap |
-| H-7 | MAC-less decryption with `peer_has_mac` (bit-flipping) | NF_DROP when `peer_has_mac && !has_tm` |
-| H-8 | Module exit doesn't flush workqueue → use-after-free | `flush_scheduled_work()` in `tcps_exit()` |
+| H-7 | Decryption without MAC with `peer_has_mac` (bit-flipping) | NF_DROP when `peer_has_mac && !has_tm` |
+| H-8 | Module exit does not flush workqueue → use-after-free | `flush_scheduled_work()` in `tcps_exit()` |
 
 ## MEDIUM (9 fixes)
 
 | # | Vulnerability | Fix |
 |---|-----------|-------------|
 | M-1 | ChaCha20 `blk[]` keystream remains on the stack | `memzero_explicit(blk)` after each block |
-| M-2 | KDF label buffer overflow (no strlen check) | `strlen` limited to 31 bytes |
-| M-3 | KEYXCHG_AUTH without prev_psk → REJECT blocks PSK exchange | WARN + accept as plain KEYXCHG (race condition on first rotation) |
-| M-4 | TCP options parser scans in payload (false TM match) | `tcps_opt_end()` limits scan to `th->doff*4` |
+| M-2 | KDF label buffer overflow (no strlen check) | `strlen` is limited to 31 bytes |
+| M-3 | KEYXCHG_AUTH without prev_psk → REJECT blocks PSK exchange | WARN + accept KEYXCHG as plain (race condition during first rotation) |
+| M-4 | TCP options parser scans payload (false TM match) | `tcps_opt_end()` limits scan to `th->doff*4` |
 | M-5 | FIN sets DEAD too early (retransmit without encryption) | FIN sets `kill=1`, state remains KEYED until cleanup timeout |
 | M-6 | `kernel_sendmsg` inside `rcu_read_lock` during rotation | Collecting addresses under RCU, sending outside RCU |
 | M-7 | `tcps_recalc_csum` with negative tcplen → crash | Checking `tcplen < sizeof(tcphdr)` |
 | M-8 | Unlimited peer table (OOM from scanning) | `TCPS_MAX_PEERS=64` with atomic counter |
 | M-9 | MAC and encryption at the same keystream position | MAC at `pos+32` (offset by 1 ChaCha20 block) |
-| M-10 | DH shared desync during simultaneous rotation (fingerprints do not match) | DISCOVER instead of KEYXCHG during rotation + prev_init_key DH retry + curve25519(decrypted)==pkt.pubkey verification |
-| M-11 | KEYXCHG_AUTH FAILED → REJECT blocks PSK during race conditions | WARN + continue as plain KEYXCHG (MITM is impossible without a private key) |
+| M-10 | DH shared desync during simultaneous rotation (fingerprints don't match) | DISCOVER instead of KEYXCHG during rotation + prev_init_key DH retry + curve25519(decrypted)==pkt.pubkey verification |
+| M-11 | KEYXCHG_AUTH FAILED → REJECT blocks PSK during race condition | WARN + continue as plain KEYXCHG (MITM is impossible without a private key) |
 
 ## LOW/INFO (retained)
 
-| Vulnerability | Cause |
+| Vulnerability | Reason |
 |-----------|---------|
 | MAC 4 bytes instead of 16 | TM option 12B won't fit in most packets |
-| ACK-only packets without MAC | No payload → no position for MAC |
+| ACK-only packets without MAC | No payload → no MAC position |
 | RST in cleartext | Partial protection: RST without MAC when peer_has_mac → DROP |
-| The first exchange is vulnerable to MITM attacks | Detectable via fingerprint verification |
+| First exchange vulnerable to MITM | Detectable via fingerprint verify |
 | No version negotiation in the protocol | The current version is the only one |
 
 # Deployment
@@ -397,12 +400,12 @@ insmod tcps.ko psk_require_verify=1
 
 PSK verification (on both machines):
 ```bash
-# Step 1: Check fingerprint
+# Step 1: Verify fingerprint
 cat /proc/tcps_peers
-# Peer A: 192.168.1.42 ... psk=unverified fp=02f9b20aad44590b
-# Peer B: 192.168.1.151 ... psk=unverified fp=02f9b20aad44590b
+# Node A: 192.168.1.42 ... psk=unverified fp=02f9b20aad44590b
+# Node B: 192.168.1.151 ... psk=unverified fp=02f9b20aad44590b
 
-# Step 2: if fp matches - confirm
+# Step 2: If fp matches, verify
 echo "verify 192.168.1.42 02f9b20aad44590b" > /proc/tcps_peers
 
 # Step 3: Verify
@@ -416,6 +419,7 @@ rmmod tcps
 ```
 
 # Verifying operation
+
 ## dmesg
 
 ```bash
@@ -522,22 +526,22 @@ tcpdump -i ens18 -A -s0 tcp
 | Seq wrap | 32-bit wraparound is tracked (seq_hi) → no keystream reuse |
 | Duplicate conn | `tcps_conn_add_unique()` — no duplicates during SYN retransmit |
 | Peer limit | Max 64 peers (TCPS_MAX_PEERS) — OOM protection |
-| Privilege | memzero_explicit, RAM only, not written to disk |
+| Privilege | memzero_explicit, key in RAM (optional on disk 0600) |
 | RCU/lifecycle | Correct RCU callbacks, flush_scheduled_work() on unload |
 
 # Known limitations
 
 | Limitation | Description |
 |-------------|----------|
-| IPv4 only | IPv6 not yet supported |
+| IPv4 only | IPv6 is not yet supported |
 | GSO without encryption | GSO packets are skipped entirely (segments cannot be authenticated) |
 | MAC 4 bytes | Truncated Poly1305 tag (2^32 forgery), the full 16B will not fit in the TCP option |
 | First-use MITM | The first exchange is vulnerable to MITM (detectable via fingerprint) |
 | PSK verify manually | The operator must compare fingerprints on both machines |
-| TOFU + PSK in-memory | Lost during rmmod, keys are not saved to disk |
-| Reload breaks connections | Existing TCP sessions are broken during rmmod/insmod |
+| Keypair persistence | Optional: `key_file=` → file 0600; without parameter - RAM only (forward secrecy with rmmod) |
+| Reload breaks connections | Existing TCP sessions are broken with rmmod/insmod |
 | TM option is not removed | TM option remains on reception (TCP stack ignores kind=253) |
-| Options may not fit | With SACK blocks + TM (8B), the TCP option space may exceed 40B |
+| Options may not fit | With SACK blocks + TM (8B) may exceed 40B TCP option space |
 | ACK-only without MAC | Packets without payload are not signed |
 | RST in cleartext | Partial protection: RST without MAC when peer_has_mac → DROP |
 | No version negotiation | Protocol changes are incompatible |

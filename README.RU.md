@@ -207,9 +207,10 @@ echo "verify 192.168.1.42 02f9b20aad44590b" > /proc/tcps_peers
 | `strict_tofu` | 0 | 0=обновлять ключ с warning, 1=блокировать при смене |
 | `psk_require_verify` | 0 | 0=PSK сразу, 1=требовать verify перед полным PSK |
 | `rotate_interval` | 3600 | Интервал ротации init-key в секундах |
+| `key_file` | (пустой) | Файл для сохранения init-key (пустой=только RAM, напр. /etc/tcps/init_key) |
 
 ```bash
-insmod tcps.ko skip_ports=22,443 strict_tofu=1 psk_require_verify=1
+insmod tcps.ko skip_ports=22,443 strict_tofu=1 psk_require_verify=1 key_file=/etc/tcps/init_key
 cat /sys/module/tcps/parameters/psk_require_verify
 echo 1 > /sys/module/tcps/parameters/psk_require_verify
 ```
@@ -284,11 +285,14 @@ TCP option kind=253 (экспериментальный диапазон RFC 472
 # Перезагрузка модуля (reload)
 
 При `rmmod` + `insmod`:
-1. Генерируется **новый** init_key + pub_key
-2. Таблица соединений очищается
-3. TOFU-кеш очищается, PSK теряется
-4. Новый SYN триггерит unicast DISCOVER → PSK пересчитывается
-5. PSK нужно верифицировать заново (при `psk_require_verify=1`)
+1. Init_key **по умолчанию только в RAM** (нет файла на диске)
+2. При загрузке — если `key_file` не задан → генерируется новый init_key (forward secrecy при rmmod)
+3. При загрузке — если `key_file=/etc/tcps/init_key` → загружается из файла → **тот же pubkey** → TOFU/PSK сохраняются
+4. Файл ключа — права 0600, root-only (аналог ~/.ssh/id_rsa)
+5. Таблица соединений очищается при rmmod (существующие TCP-сессии ломаются)
+6. TOFU-кеш и PSK сохраняются при key_file (pubkey не меняется)
+
+**Рекомендация:** используйте `key_file=` для серверов (TOFU consistency), без него — для рабочих станций (максимальный forward secrecy)
 
 **Влияние на соединения:**
 
@@ -522,7 +526,7 @@ tcpdump -i ens18 -A -s0 tcp
 | Seq wrap | 32-bit wraparound отслеживается (seq_hi) → нет keystream reuse |
 | Duplicate conn | `tcps_conn_add_unique()` — нет дубликатов при SYN retransmit |
 | Peer limit | Max 64 пира (TCPS_MAX_PEERS) — защита от OOM |
-| Privilege | memzero_explicit, только в RAM, на диск не пишутся |
+| Privilege | memzero_explicit, ключ в RAM (опционально на диске 0600) |
 | RCU/lifecycle | Правильные RCU callbacks, flush_scheduled_work() при unload |
 
 # Известные ограничения
@@ -534,7 +538,7 @@ tcpdump -i ens18 -A -s0 tcp
 | MAC 4 байта | Усечённый Poly1305 тег (2^32 forgery), полный 16B не влезет в TCP option |
 | First-use MITM | Первый обмен уязвим к MITM (обнаруживается через fingerprint) |
 | PSK verify ручной | Оператор должен сравнить fingerprint на обеих машинах |
-| TOFU + PSK in-memory | Теряется при rmmod, ключи на диск не сохраняются |
+| Keypair persistence | Опционально: `key_file=` → файл 0600; без параметра — только RAM (forward secrecy при rmmod) |
 | Reload ломает соединения | Существующие TCP-сессии ломаются при rmmod/insmod |
 | TM option не удаляется | На приёме TM option остаётся (TCP stack игнорирует kind=253) |
 | Опции могут не влезть | При SACK blocks + TM (8B) может превысить 40B TCP option space |

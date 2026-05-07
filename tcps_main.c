@@ -13,6 +13,8 @@
 #include <linux/proc_fs.h>
 #include <linux/seq_file.h>
 #include <linux/sockptr.h>
+#include <linux/fs.h>
+#include <linux/uaccess.h>
 #include <net/checksum.h>
 #include <net/ip.h>
 #include <net/sock.h>
@@ -54,6 +56,73 @@ static uint8_t tcps_my_init_key[CURVE25519_KEY_SIZE];
 static uint8_t tcps_my_public[CURVE25519_KEY_SIZE];
 static uint8_t tcps_prev_init_key[CURVE25519_KEY_SIZE];
 static int tcps_has_prev_init;
+
+#define TCPS_KEY_DESC		"tcps:init-key"
+
+static char *tcps_key_file;
+module_param_named(key_file, tcps_key_file, charp, 0444);
+MODULE_PARM_DESC(key_file, "File to persist init-key across reloads (empty=RAM only, e.g. /etc/tcps/init_key)");
+
+static int tcps_load_init_key(void)
+{
+	struct file *f;
+	loff_t pos = 0;
+	uint8_t buf[32];
+	ssize_t ret;
+
+	if (!tcps_key_file || !tcps_key_file[0])
+		return -ENOENT;
+
+	f = filp_open(tcps_key_file, O_RDONLY, 0);
+	if (IS_ERR(f))
+		return -ENOENT;
+
+	ret = kernel_read(f, buf, 32, &pos);
+	filp_close(f, NULL);
+
+	if (ret != 32) {
+		memzero_explicit(buf, sizeof(buf));
+		return -EIO;
+	}
+
+	{
+		int i;
+		uint8_t z = 0;
+		for (i = 0; i < 32; i++)
+			z |= buf[i];
+		if (z == 0) {
+			memzero_explicit(buf, sizeof(buf));
+			return -EINVAL;
+		}
+	}
+
+	memcpy(tcps_my_init_key, buf, 32);
+	if (!curve25519_generate_public(tcps_my_public, tcps_my_init_key)) {
+		memzero_explicit(buf, sizeof(buf));
+		return -EINVAL;
+	}
+	memzero_explicit(buf, sizeof(buf));
+	return 0;
+}
+
+static int tcps_save_init_key(void)
+{
+	struct file *f;
+	loff_t pos = 0;
+	ssize_t ret;
+
+	if (!tcps_key_file || !tcps_key_file[0])
+		return 0;
+
+	f = filp_open(tcps_key_file, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+	if (IS_ERR(f))
+		return PTR_ERR(f);
+
+	ret = kernel_write(f, tcps_my_init_key, 32, &pos);
+	filp_close(f, NULL);
+
+	return (ret == 32) ? 0 : -EIO;
+}
 
 static DEFINE_HASHTABLE(tcps_table, TCPS_HASH_BITS);
 static DEFINE_SPINLOCK(tcps_lock);
@@ -1018,7 +1087,6 @@ static int tcps_disc_recv(struct socket *sock)
 
 	} else if (pkt.type == TCPS_DISC_TYPE_KEYXCHG ||
 		   pkt.type == TCPS_DISC_TYPE_KEYXCHG_AUTH) {
-		struct tcps_peer *p;
 		uint8_t dh_shared[32];
 		uint8_t peer_init_key[32];
 		uint8_t psk[32];
@@ -1294,6 +1362,9 @@ static void tcps_rotate_init_key(struct work_struct *w)
 
 	memzero_explicit(old_key, sizeof(old_key));
 
+	if (tcps_save_init_key() != 0)
+		pr_warn("tcps: failed to save rotated init-key\n");
+
 	{
 		struct socket *sock = READ_ONCE(tcps_disc_sock);
 		if (sock) {
@@ -1417,14 +1488,28 @@ static const struct proc_ops tcps_peers_proc_ops = {
 
 static int __init tcps_init(void)
 {
-	tcps_gen_keypair(tcps_my_init_key, tcps_my_public);
+	int loaded;
 
-	pr_info("tcps: X25519 init-key generated, pubkey=");
+	loaded = tcps_load_init_key();
+
+	if (loaded == 0) {
+		pr_info("tcps: init-key loaded from %s, pubkey=", tcps_key_file);
+	} else {
+		tcps_gen_keypair(tcps_my_init_key, tcps_my_public);
+		pr_info("tcps: X25519 init-key generated, pubkey=");
+	}
 	{
 		int i;
 		for (i = 0; i < 8; i++)
 			pr_cont("%02x", tcps_my_public[i]);
 		pr_cont("...\n");
+	}
+
+	if (tcps_save_init_key() == 0) {
+		if (tcps_key_file && tcps_key_file[0])
+			pr_info("tcps: init-key saved to %s\n", tcps_key_file);
+	} else {
+		pr_warn("tcps: failed to save init-key\n");
 	}
 
 	nf_register_net_hooks(&init_net, tcps_nf_ops, ARRAY_SIZE(tcps_nf_ops));
