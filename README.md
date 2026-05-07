@@ -10,9 +10,6 @@ tcps/
 │ ├── tcps_main.c # Netfilter hooks, probe/TM options, TOFU unicast discovery, PSK verify, key rotation
 │ ├── tcps_crypto.c # ChaCha20 stream cipher + Poly1305 MAC + X25519 DH + KDF + PSK derivation
 │ └── Makefile # Build: make → tcps.ko
-├── v2/ # X25519 DH + ChaCha20 + TOFU (without init-key exchange)
-├── kernel/ # Old v1 (broken on GSO, unused)
-└── README.md
 ```
 
 # How it works
