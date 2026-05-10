@@ -555,7 +555,6 @@ tcpdump -i ens18 -A -s0 tcp
 | Limitation | Description |
 |------------|----------|
 | IPv4 only | IPv6 not yet supported |
-| GSO throughput reduction | Without GSO, more packets are in the stack, but all traffic is encrypted; noticeable at rates >500 Mbps |
 | MAC 4 bytes | Truncated Poly1305 tag (2^32 forgery), the full 16B won't fit in the TCP option |
 | First-use MITM | The first exchange is vulnerable to MITM (detectable via fingerprint) |
 | PSK verify manually | The operator must compare fingerprints on both machines |
