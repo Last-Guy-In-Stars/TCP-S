@@ -19,7 +19,6 @@
 #include <net/ip.h>
 #include <net/sock.h>
 #include <net/gso.h>
-#include <crypto/curve25519.h>
 #include "tcps.h"
 
 MODULE_LICENSE("GPL");
@@ -53,12 +52,10 @@ static int tcps_should_skip(__be16 port)
 	return 0;
 }
 
-static uint8_t tcps_my_init_key[CURVE25519_KEY_SIZE];
-static uint8_t tcps_my_public[CURVE25519_KEY_SIZE];
-static uint8_t tcps_prev_init_key[CURVE25519_KEY_SIZE];
+static uint8_t tcps_my_init_key[32];
+static uint8_t tcps_my_public[32];
+static uint8_t tcps_prev_init_key[32];
 static int tcps_has_prev_init;
-
-#define TCPS_KEY_DESC		"tcps:init-key"
 
 static char *tcps_key_file;
 module_param_named(key_file, tcps_key_file, charp, 0444);
@@ -98,7 +95,7 @@ static int tcps_load_init_key(void)
 	}
 
 	memcpy(tcps_my_init_key, buf, 32);
-	if (!curve25519_generate_public(tcps_my_public, tcps_my_init_key)) {
+	if (tcps_derive_public(tcps_my_init_key, tcps_my_public) != 0) {
 		memzero_explicit(buf, sizeof(buf));
 		return -EINVAL;
 	}
@@ -136,23 +133,79 @@ static int tcps_peer_count;
 #define TCPS_OPT_LEN	4
 #define TCPS_OPT_MAGIC	0x5443
 
-#define TCPS_TM_OPT_KIND	253
-#define TCPS_TM_OPT_LEN		8
-#define TCPS_TM_OPT_MAGIC	0x544D
-
 #define TCPS_DISC_PORT	54321
 #define TCPS_DISC_MAGIC	0x54435053
+
+#define TCPS_DISC_RATE_PER_IP	(2 * HZ)
+#define TCPS_DISC_RATE_GLOBAL	10
+#define TCPS_DISC_RATE_PERIOD	HZ
+
+struct tcps_disc_rate {
+	__be32 addr;
+	unsigned long last_recv;
+};
+
+static struct tcps_disc_rate tcps_disc_rates[16];
+static spinlock_t tcps_disc_rate_lock;
+static unsigned long tcps_disc_global_last;
+static int tcps_disc_global_count;
 
 struct tcps_disc_pkt {
 	__be32 magic;
 	uint8_t type;
-	uint8_t pubkey[CURVE25519_KEY_SIZE];
-	uint8_t enc_init[CURVE25519_KEY_SIZE];
+	uint8_t pubkey[32];
+	uint8_t enc_init[32];
 	uint8_t auth_tag[TCPS_MAC_SIZE];
 };
 
 static struct socket *tcps_disc_sock;
 static struct task_struct *tcps_disc_task;
+
+static int tcps_disc_rate_check(__be32 addr)
+{
+	unsigned long now = jiffies;
+	int i, slot = -1;
+
+	spin_lock(&tcps_disc_rate_lock);
+
+	if (now - tcps_disc_global_last >= TCPS_DISC_RATE_PERIOD) {
+		tcps_disc_global_count = 0;
+		tcps_disc_global_last = now;
+	}
+	if (tcps_disc_global_count >= TCPS_DISC_RATE_GLOBAL) {
+		spin_unlock(&tcps_disc_rate_lock);
+		return -1;
+	}
+
+	for (i = 0; i < 16; i++) {
+		if (tcps_disc_rates[i].addr == 0) {
+			if (slot < 0)
+				slot = i;
+			continue;
+		}
+		if (tcps_disc_rates[i].addr == addr) {
+			if (now - tcps_disc_rates[i].last_recv < TCPS_DISC_RATE_PER_IP) {
+				spin_unlock(&tcps_disc_rate_lock);
+				return -1;
+			}
+			tcps_disc_rates[i].last_recv = now;
+			tcps_disc_global_count++;
+			spin_unlock(&tcps_disc_rate_lock);
+			return 0;
+		}
+		if (now - tcps_disc_rates[i].last_recv > TCPS_DISC_RATE_PERIOD * 4)
+			tcps_disc_rates[i].addr = 0;
+	}
+
+	if (slot < 0)
+		slot = 0;
+
+	tcps_disc_rates[slot].addr = addr;
+	tcps_disc_rates[slot].last_recv = now;
+	tcps_disc_global_count++;
+	spin_unlock(&tcps_disc_rate_lock);
+	return 0;
+}
 
 static struct tcps_peer *tcps_peer_lookup(__be32 addr)
 {
@@ -400,75 +453,35 @@ static int tcps_add_probe(struct sk_buff *skb)
 	return 1;
 }
 
-static int tcps_find_tm_option(const struct tcphdr *th, int tcplen,
-			       uint8_t tag[TCPS_MAC_SIZE])
+static void tcps_reduce_mss(struct sk_buff *skb, uint16_t reduction)
 {
+	struct tcphdr *th = tcp_hdr(skb);
 	int off = sizeof(*th);
-	int end = tcps_opt_end(th, tcplen);
-	const uint8_t *opt = (const uint8_t *)th;
+	int end = th->doff * 4;
+	uint8_t *opt = (uint8_t *)th;
 
 	while (off + 1 < end) {
 		if (opt[off] == 0)
-			return 0;
+			return;
 		if (opt[off] == 1) {
 			off++;
 			continue;
 		}
 		if (off + opt[off + 1] > end || opt[off + 1] < 2)
-			return 0;
-		if (opt[off] == TCPS_TM_OPT_KIND && opt[off + 1] == TCPS_TM_OPT_LEN) {
-			uint16_t magic = (uint16_t)opt[off + 2] << 8 |
-					 (uint16_t)opt[off + 3];
-			if (magic == TCPS_TM_OPT_MAGIC) {
-				memcpy(tag, opt + off + 4, TCPS_MAC_SIZE);
-				return 1;
+			return;
+		if (opt[off] == 2 && opt[off + 1] == 4) {
+			uint16_t mss = ((uint16_t)opt[off + 2] << 8) |
+					(uint16_t)opt[off + 3];
+			if (mss > reduction) {
+				mss -= reduction;
+				opt[off + 2] = (mss >> 8) & 0xff;
+				opt[off + 3] = mss & 0xff;
+				tcps_recalc_csum(skb);
 			}
+			return;
 		}
 		off += opt[off + 1];
 	}
-	return 0;
-}
-
-static int tcps_add_tm_option(struct sk_buff *skb, const uint8_t tag[TCPS_MAC_SIZE])
-{
-	struct iphdr *iph;
-	struct tcphdr *th;
-	int old_doff, total = TCPS_TM_OPT_LEN;
-	int tcplen, payload_len;
-	uint8_t *opt, *from, *to;
-
-	if (skb_tailroom(skb) < total + 64) {
-		if (pskb_expand_head(skb, 0, total + 64, GFP_ATOMIC))
-			return 0;
-	}
-
-	iph = ip_hdr(skb);
-	th = tcp_hdr(skb);
-	old_doff = th->doff * 4;
-	tcplen = ntohs(iph->tot_len) - iph->ihl * 4;
-	payload_len = tcplen - old_doff;
-	if (payload_len < 0)
-		payload_len = 0;
-	if (old_doff + total > 60)
-		return 0;
-
-	skb_put(skb, total);
-
-	from = (uint8_t *)th + old_doff;
-	to = from + total;
-	if (payload_len > 0)
-		memmove(to, from, payload_len);
-
-	opt = from;
-	opt[0] = TCPS_TM_OPT_KIND;
-	opt[1] = TCPS_TM_OPT_LEN;
-	opt[2] = (TCPS_TM_OPT_MAGIC >> 8) & 0xff;
-	opt[3] = TCPS_TM_OPT_MAGIC & 0xff;
-	memcpy(opt + 4, tag, TCPS_MAC_SIZE);
-
-	th->doff += total / 4;
-	iph->tot_len = htons(ntohs(iph->tot_len) + total);
-	return 1;
 }
 
 static uint64_t tcps_send_pos(struct tcps_conn *c, uint32_t seq)
@@ -577,7 +590,7 @@ static void tcps_derive_conn_keys(struct tcps_conn *c)
 
 		rcu_read_lock();
 		p = tcps_peer_lookup(peer_addr);
-		if (p && tcps_dh_shared(READ_ONCE(tcps_my_init_key[0]) ? tcps_my_init_key : tcps_my_init_key,
+		if (p && tcps_dh_shared(tcps_my_init_key,
 					p->public_key, dh_shared) == 0) {
 			int i;
 			uint8_t z = 0;
@@ -685,6 +698,7 @@ static unsigned int tcps_out(void *priv, struct sk_buff *skb,
 			if (tcps_add_probe(skb)) {
 				iph = ip_hdr(skb);
 				th = tcp_hdr(skb);
+				tcps_reduce_mss(skb, TCPS_MAC_SIZE);
 				c = tcps_conn_add_unique(iph->saddr, th->source,
 							 iph->daddr, th->dest);
 				if (c) {
@@ -720,6 +734,7 @@ static unsigned int tcps_out(void *priv, struct sk_buff *skb,
 		if (c->state == TCPS_PROBE_SYNACK || c->state == TCPS_KEYED) {
 			c->server_isn = ntohl(th->seq);
 			tcps_add_probe(skb);
+			tcps_reduce_mss(skb, TCPS_MAC_SIZE);
 			if (c->client_isn && c->server_isn && !c->keys_derived)
 				tcps_derive_conn_keys(c);
 		}
@@ -809,7 +824,22 @@ static unsigned int tcps_out(void *priv, struct sk_buff *skb,
 						 (uint8_t *)nth +
 						 nth->doff * 4,
 						 np_len, tag);
-				tcps_add_tm_option(nskb, tag);
+
+				if (skb_tailroom(nskb) < TCPS_MAC_SIZE) {
+					if (pskb_expand_head(nskb, 0,
+							     TCPS_MAC_SIZE,
+							     GFP_ATOMIC)) {
+						kfree_skb(nskb);
+						continue;
+					}
+					niph = ip_hdr(nskb);
+					nth = tcp_hdr(nskb);
+				}
+			memcpy(skb_put(nskb, TCPS_MAC_SIZE),
+			       tag, TCPS_MAC_SIZE);
+				nskb->truesize += TCPS_MAC_SIZE;
+				niph->tot_len = htons(ntohs(niph->tot_len) +
+						      TCPS_MAC_SIZE);
 				tcps_recalc_csum(nskb);
 			}
 
@@ -868,11 +898,25 @@ static unsigned int tcps_out(void *priv, struct sk_buff *skb,
 			tcps_compute_mac(c->mac_enc_key, pos, aad, 5,
 					 (uint8_t *)th + th->doff * 4,
 					 payload_len, tag);
-			if (tcps_add_tm_option(skb, tag)) {
+
+			if (skb_tailroom(skb) < TCPS_MAC_SIZE) {
+				if (pskb_expand_head(skb, 0, TCPS_MAC_SIZE,
+						     GFP_ATOMIC)) {
+					memzero_explicit(tag, sizeof(tag));
+					spin_unlock_bh(&c->lock);
+					rcu_read_unlock();
+					return NF_DROP;
+				}
 				iph = ip_hdr(skb);
 				th = tcp_hdr(skb);
-				tcps_recalc_csum(skb);
 			}
+			memcpy(skb_put(skb, TCPS_MAC_SIZE), tag,
+			       TCPS_MAC_SIZE);
+			skb->truesize += TCPS_MAC_SIZE;
+			iph->tot_len = htons(ntohs(iph->tot_len) +
+					      TCPS_MAC_SIZE);
+			tcps_recalc_csum(skb);
+			memzero_explicit(tag, sizeof(tag));
 		}
 	}
 
@@ -925,6 +969,7 @@ static unsigned int tcps_in(void *priv, struct sk_buff *skb,
 		}
 
 		if (tcps_has_probe(th, tcplen)) {
+			tcps_reduce_mss(skb, TCPS_MAC_SIZE);
 			c = tcps_conn_add_unique(iph->saddr, th->source,
 						 iph->daddr, th->dest);
 			if (c) {
@@ -952,6 +997,7 @@ static unsigned int tcps_in(void *priv, struct sk_buff *skb,
 			spin_lock_bh(&c->lock);
 			if (c->state == TCPS_PROBE_SYN && has_probe) {
 				c->server_isn = ntohl(th->seq);
+				tcps_reduce_mss(skb, TCPS_MAC_SIZE);
 				if (c->client_isn && c->server_isn && !c->keys_derived)
 					tcps_derive_conn_keys(c);
 			} else if (c->state == TCPS_PROBE_SYN && !has_probe) {
@@ -985,15 +1031,16 @@ static unsigned int tcps_in(void *priv, struct sk_buff *skb,
 	}
 
 	if (th->rst) {
-		int tcplen = ntohs(iph->tot_len) - iph->ihl * 4;
-		uint8_t recv_tag[TCPS_MAC_SIZE];
-
-		if (c->peer_has_mac && !tcps_find_tm_option(th, tcplen, recv_tag)) {
-			pr_warn("tcps: RST without MAC from %pI4 -> DROP (injection?)\n",
-				&iph->saddr);
-			spin_unlock_bh(&c->lock);
-			rcu_read_unlock();
-			return NF_DROP;
+		if (c->peer_has_mac) {
+			int rst_tcplen = ntohs(iph->tot_len) - iph->ihl * 4;
+			int rst_paylen = rst_tcplen - th->doff * 4;
+			if (rst_paylen > 0 && rst_paylen < TCPS_MAC_SIZE) {
+				pr_warn("tcps: RST without MAC from %pI4 -> DROP (injection?)\n",
+					&iph->saddr);
+				spin_unlock_bh(&c->lock);
+				rcu_read_unlock();
+				return NF_DROP;
+			}
 		}
 		c->kill = 1;
 		spin_unlock_bh(&c->lock);
@@ -1007,50 +1054,66 @@ static unsigned int tcps_in(void *priv, struct sk_buff *skb,
 		payload_len = 0;
 
 	if (payload_len > 0 && c->keys_derived) {
-		int tcplen = ntohs(iph->tot_len) - iph->ihl * 4;
-		uint8_t recv_tag[TCPS_MAC_SIZE];
-		int has_tm = tcps_find_tm_option(th, tcplen, recv_tag);
-
-		if (has_tm) {
+		if (payload_len >= TCPS_MAC_SIZE) {
 			uint8_t aad[5];
 			uint8_t exp_tag[TCPS_TAG_SIZE];
+			uint8_t recv_tag[TCPS_MAC_SIZE];
+			uint32_t enc_len = payload_len - TCPS_MAC_SIZE;
+			uint8_t *payload_start = (uint8_t *)th + th->doff * 4;
+
+			memcpy(recv_tag, payload_start + enc_len, TCPS_MAC_SIZE);
 
 			pos = tcps_recv_pos(c, ntohl(th->seq));
-
 			tcps_build_aad(aad, th);
-			tcps_compute_mac(c->mac_dec_key, pos, aad, 5,
-					 (uint8_t *)th + th->doff * 4,
-					 payload_len, exp_tag);
+
+			if (enc_len > 0)
+				tcps_compute_mac(c->mac_dec_key, pos, aad, 5,
+						 payload_start, enc_len,
+						 exp_tag);
+			else
+				tcps_compute_mac(c->mac_dec_key, pos, aad, 5,
+						 NULL, 0, exp_tag);
 
 			if (tcps_ct_memcmp(recv_tag, exp_tag, TCPS_MAC_SIZE) != 0) {
 				pr_warn("tcps: MAC FAILED from %pI4 -> DROP (tampering?)\n",
 					&iph->saddr);
 				memzero_explicit(exp_tag, sizeof(exp_tag));
+				memzero_explicit(recv_tag, sizeof(recv_tag));
 				spin_unlock_bh(&c->lock);
 				rcu_read_unlock();
 				return NF_DROP;
 			}
 			memzero_explicit(exp_tag, sizeof(exp_tag));
+			memzero_explicit(recv_tag, sizeof(recv_tag));
 			c->peer_has_mac = 1;
-		} else if (c->peer_has_mac) {
-			pr_warn_ratelimited("tcps: no MAC from %pI4 -> DROP\n",
-					    &iph->saddr);
-			spin_unlock_bh(&c->lock);
-			rcu_read_unlock();
-			return NF_DROP;
+
+			if (enc_len > 0) {
+				if (payload_off + payload_len > skb->len) {
+					spin_unlock_bh(&c->lock);
+					rcu_read_unlock();
+					return NF_DROP;
+				}
+				chacha20_xor_stream(c->dec_key, pos,
+						    payload_start, enc_len);
+			}
+
+			skb_trim(skb, skb->len - TCPS_MAC_SIZE);
+			if (skb->sk)
+				atomic_sub(TCPS_MAC_SIZE, &skb->sk->sk_rmem_alloc);
+			skb->truesize -= TCPS_MAC_SIZE;
+			iph = ip_hdr(skb);
+			th = tcp_hdr(skb);
+			iph->tot_len = htons(ntohs(iph->tot_len) - TCPS_MAC_SIZE);
+			tcps_recalc_csum(skb);
+		} else {
+			if (c->peer_has_mac) {
+				pr_warn_ratelimited("tcps: no MAC from %pI4 -> DROP\n",
+						    &iph->saddr);
+				spin_unlock_bh(&c->lock);
+				rcu_read_unlock();
+				return NF_DROP;
+			}
 		}
-
-		pos = tcps_recv_pos(c, ntohl(th->seq));
-
-		if (payload_off + payload_len > skb->len) {
-			spin_unlock_bh(&c->lock);
-			rcu_read_unlock();
-			return NF_DROP;
-		}
-
-		chacha20_xor_stream(c->dec_key, pos,
-				    (uint8_t *)th + th->doff * 4, payload_len);
-		tcps_recalc_csum(skb);
 	}
 
 	if (th->fin) {
@@ -1114,9 +1177,9 @@ static void tcps_send_keyxchg(struct socket *sock, __be32 peer_addr,
 	memset(&pkt, 0, sizeof(pkt));
 	pkt.magic = htonl(TCPS_DISC_MAGIC);
 	pkt.type = TCPS_DISC_TYPE_KEYXCHG;
-	memcpy(pkt.pubkey, tcps_my_public, CURVE25519_KEY_SIZE);
-	memcpy(pkt.enc_init, tcps_my_init_key, CURVE25519_KEY_SIZE);
-	chacha20_xor_stream(dh_shared, 0, pkt.enc_init, CURVE25519_KEY_SIZE);
+	memcpy(pkt.pubkey, tcps_my_public, 32);
+	memcpy(pkt.enc_init, tcps_my_init_key, 32);
+	chacha20_xor_stream(dh_shared, 0, pkt.enc_init, 32);
 
 	has_prev = tcps_peer_get_prev_psk(peer_addr, prev_psk);
 	if (has_prev == 0) {
@@ -1175,7 +1238,10 @@ static int tcps_disc_recv(struct socket *sock)
 	if (pkt.magic != htonl(TCPS_DISC_MAGIC))
 		return -EINVAL;
 
-	if (memcmp(pkt.pubkey, tcps_my_public, CURVE25519_KEY_SIZE) == 0)
+	if (memcmp(pkt.pubkey, tcps_my_public, 32) == 0)
+		return 0;
+
+	if (tcps_disc_rate_check(addr.sin_addr.s_addr) < 0)
 		return 0;
 
 	if (pkt.type == TCPS_DISC_TYPE_DISCOVER) {
@@ -1266,7 +1332,7 @@ static int tcps_disc_recv(struct socket *sock)
 				memcpy(trial_init, pkt.enc_init, 32);
 				chacha20_xor_stream(trial_dh, 0, trial_init, 32);
 
-				if (!curve25519_generate_public(trial_pub, trial_init))
+				if (tcps_derive_public(trial_init, trial_pub) != 0)
 					continue;
 				if (memcmp(trial_pub, peer_pub, 32) != 0) {
 					memzero_explicit(trial_dh, 32);
@@ -1328,7 +1394,7 @@ static void tcps_send_discover_unicast(struct socket *sock, __be32 peer_addr)
 	memset(&pkt, 0, sizeof(pkt));
 	pkt.magic = htonl(TCPS_DISC_MAGIC);
 	pkt.type = TCPS_DISC_TYPE_DISCOVER;
-	memcpy(pkt.pubkey, tcps_my_public, CURVE25519_KEY_SIZE);
+	memcpy(pkt.pubkey, tcps_my_public, 32);
 
 	memset(&addr, 0, sizeof(addr));
 	addr.sin_family = AF_INET;
@@ -1442,12 +1508,12 @@ static int tcps_disc_thread(void *data)
 
 static void tcps_rotate_init_key(struct work_struct *w)
 {
-	uint8_t old_key[CURVE25519_KEY_SIZE];
+	uint8_t old_key[32];
 
-	memcpy(old_key, tcps_my_init_key, CURVE25519_KEY_SIZE);
+	memcpy(old_key, tcps_my_init_key, 32);
 
 	spin_lock(&tcps_peers_lock);
-	memcpy(tcps_prev_init_key, tcps_my_init_key, CURVE25519_KEY_SIZE);
+	memcpy(tcps_prev_init_key, tcps_my_init_key, 32);
 	tcps_has_prev_init = 1;
 	tcps_gen_keypair(tcps_my_init_key, tcps_my_public);
 	spin_unlock(&tcps_peers_lock);
@@ -1589,6 +1655,8 @@ static const struct proc_ops tcps_peers_proc_ops = {
 static int __init tcps_init(void)
 {
 	int loaded;
+
+	spin_lock_init(&tcps_disc_rate_lock);
 
 	loaded = tcps_load_init_key();
 

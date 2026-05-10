@@ -2,7 +2,6 @@
 #include <linux/string.h>
 #include <linux/random.h>
 #include <linux/module.h>
-#include <crypto/curve25519.h>
 #include "tcps.h"
 
 static inline uint32_t load_le32(const uint8_t *p)
@@ -197,33 +196,329 @@ void tcps_derive_psk_fallback(const uint8_t dh_shared[32], uint8_t psk[32])
 	memzero_explicit(input, sizeof(input));
 }
 
+typedef int64_t limb;
+typedef limb fe[5];
+
+#define MASK51 ((limb)0x7FFFFFFFFFFFF)
+
+static void fe_load(fe h, const uint8_t s[32])
+{
+	uint64_t x;
+
+	x = (uint64_t)s[0] | ((uint64_t)s[1] << 8) |
+	    ((uint64_t)s[2] << 16) | ((uint64_t)s[3] << 24) |
+	    ((uint64_t)s[4] << 32) | ((uint64_t)s[5] << 40) |
+	    ((uint64_t)s[6] << 48) | ((uint64_t)s[7] << 56);
+	h[0] = x & MASK51;
+
+	x = (uint64_t)s[6] | ((uint64_t)s[7] << 8) |
+	    ((uint64_t)s[8] << 16) | ((uint64_t)s[9] << 24) |
+	    ((uint64_t)s[10] << 32) | ((uint64_t)s[11] << 40) |
+	    ((uint64_t)s[12] << 48) | ((uint64_t)s[13] << 56);
+	h[1] = (x >> 3) & MASK51;
+
+	x = (uint64_t)s[12] | ((uint64_t)s[13] << 8) |
+	    ((uint64_t)s[14] << 16) | ((uint64_t)s[15] << 24) |
+	    ((uint64_t)s[16] << 32) | ((uint64_t)s[17] << 40) |
+	    ((uint64_t)s[18] << 48) | ((uint64_t)s[19] << 56);
+	h[2] = (x >> 6) & MASK51;
+
+	x = (uint64_t)s[19] | ((uint64_t)s[20] << 8) |
+	    ((uint64_t)s[21] << 16) | ((uint64_t)s[22] << 24) |
+	    ((uint64_t)s[23] << 32) | ((uint64_t)s[24] << 40) |
+	    ((uint64_t)s[25] << 48) | ((uint64_t)s[26] << 56);
+	h[3] = (x >> 1) & MASK51;
+
+	x = (uint64_t)s[24] | ((uint64_t)s[25] << 8) |
+	    ((uint64_t)s[26] << 16) | ((uint64_t)s[27] << 24) |
+	    ((uint64_t)s[28] << 32) | ((uint64_t)s[29] << 40) |
+	    ((uint64_t)s[30] << 48) | ((uint64_t)s[31] << 56);
+	h[4] = (x >> 12) & MASK51;
+}
+
+static void fe_store(uint8_t s[32], const fe h)
+{
+	limb t[5];
+	limb c;
+	uint64_t v;
+
+	memcpy(t, h, 40);
+
+	c = t[0] >> 51; t[0] &= MASK51; t[1] += c;
+	c = t[1] >> 51; t[1] &= MASK51; t[2] += c;
+	c = t[2] >> 51; t[2] &= MASK51; t[3] += c;
+	c = t[3] >> 51; t[3] &= MASK51; t[4] += c;
+	c = t[4] >> 51; t[4] &= MASK51; t[0] += c * 19;
+
+	c = t[0] >> 51; t[0] &= MASK51; t[1] += c;
+	c = t[1] >> 51; t[1] &= MASK51; t[2] += c;
+	c = t[2] >> 51; t[2] &= MASK51; t[3] += c;
+	c = t[3] >> 51; t[3] &= MASK51; t[4] += c;
+	c = t[4] >> 51; t[4] &= MASK51; t[0] += c * 19;
+
+	t[0] += 19;
+
+	c = t[0] >> 51; t[0] &= MASK51; t[1] += c;
+	c = t[1] >> 51; t[1] &= MASK51; t[2] += c;
+	c = t[2] >> 51; t[2] &= MASK51; t[3] += c;
+	c = t[3] >> 51; t[3] &= MASK51; t[4] += c;
+	c = t[4] >> 51; t[4] &= MASK51; t[0] += c * 19;
+
+	t[0] += ((limb)1 << 51) - 19;
+	t[1] += ((limb)1 << 51) - 1;
+	t[2] += ((limb)1 << 51) - 1;
+	t[3] += ((limb)1 << 51) - 1;
+	t[4] += ((limb)1 << 51) - 1;
+
+	c = t[0] >> 51; t[0] &= MASK51; t[1] += c;
+	c = t[1] >> 51; t[1] &= MASK51; t[2] += c;
+	c = t[2] >> 51; t[2] &= MASK51; t[3] += c;
+	c = t[3] >> 51; t[3] &= MASK51; t[4] += c;
+	t[4] &= MASK51;
+
+	v = (uint64_t)t[0] | ((uint64_t)t[1] << 51);
+	s[0] = (uint8_t)(v); s[1] = (uint8_t)(v >> 8);
+	s[2] = (uint8_t)(v >> 16); s[3] = (uint8_t)(v >> 24);
+	s[4] = (uint8_t)(v >> 32); s[5] = (uint8_t)(v >> 40);
+	s[6] = (uint8_t)(v >> 48); s[7] = (uint8_t)(v >> 56);
+
+	v = ((uint64_t)t[1] >> 13) | ((uint64_t)t[2] << 38);
+	s[8] = (uint8_t)(v); s[9] = (uint8_t)(v >> 8);
+	s[10] = (uint8_t)(v >> 16); s[11] = (uint8_t)(v >> 24);
+	s[12] = (uint8_t)(v >> 32); s[13] = (uint8_t)(v >> 40);
+	s[14] = (uint8_t)(v >> 48); s[15] = (uint8_t)(v >> 56);
+
+	v = ((uint64_t)t[2] >> 26) | ((uint64_t)t[3] << 25);
+	s[16] = (uint8_t)(v); s[17] = (uint8_t)(v >> 8);
+	s[18] = (uint8_t)(v >> 16); s[19] = (uint8_t)(v >> 24);
+	s[20] = (uint8_t)(v >> 32); s[21] = (uint8_t)(v >> 40);
+	s[22] = (uint8_t)(v >> 48); s[23] = (uint8_t)(v >> 56);
+
+	v = ((uint64_t)t[3] >> 39) | ((uint64_t)t[4] << 12);
+	s[24] = (uint8_t)(v); s[25] = (uint8_t)(v >> 8);
+	s[26] = (uint8_t)(v >> 16); s[27] = (uint8_t)(v >> 24);
+	s[28] = (uint8_t)(v >> 32); s[29] = (uint8_t)(v >> 40);
+	s[30] = (uint8_t)(v >> 48); s[31] = (uint8_t)(v >> 56);
+
+	memzero_explicit(t, sizeof(t));
+}
+
+static void fe_add(fe out, const fe a, const fe b)
+{
+	int i;
+	for (i = 0; i < 5; i++)
+		out[i] = a[i] + b[i];
+}
+
+static void fe_sub(fe out, const fe a, const fe b)
+{
+	int i;
+	for (i = 0; i < 5; i++)
+		out[i] = a[i] - b[i];
+}
+
+static void fe_mul(fe out, const fe a, const fe b)
+{
+	__int128 h0, h1, h2, h3, h4;
+	limb f0 = a[0], f1 = a[1], f2 = a[2], f3 = a[3], f4 = a[4];
+	limb g0 = b[0], g1 = b[1], g2 = b[2], g3 = b[3], g4 = b[4];
+
+	h0 = (__int128)f0*g0 + 19*((__int128)f1*g4 + (__int128)f2*g3 + (__int128)f3*g2 + (__int128)f4*g1);
+	h1 = (__int128)f0*g1 + (__int128)f1*g0 + 19*((__int128)f2*g4 + (__int128)f3*g3 + (__int128)f4*g2);
+	h2 = (__int128)f0*g2 + (__int128)f1*g1 + (__int128)f2*g0 + 19*((__int128)f3*g4 + (__int128)f4*g3);
+	h3 = (__int128)f0*g3 + (__int128)f1*g2 + (__int128)f2*g1 + (__int128)f3*g0 + 19*(__int128)f4*g4;
+	h4 = (__int128)f0*g4 + (__int128)f1*g3 + (__int128)f2*g2 + (__int128)f3*g1 + (__int128)f4*g0;
+
+	h1 += h0 >> 51; h0 -= (h0 >> 51) << 51;
+	h2 += h1 >> 51; h1 -= (h1 >> 51) << 51;
+	h3 += h2 >> 51; h2 -= (h2 >> 51) << 51;
+	h4 += h3 >> 51; h3 -= (h3 >> 51) << 51;
+	h0 += (h4 >> 51) * 19; h4 -= (h4 >> 51) << 51;
+	h1 += h0 >> 51; h0 -= (h0 >> 51) << 51;
+
+	out[0] = (limb)h0; out[1] = (limb)h1; out[2] = (limb)h2;
+	out[3] = (limb)h3; out[4] = (limb)h4;
+}
+
+static void fe_sq(fe out, const fe a)
+{
+	fe_mul(out, a, a);
+}
+
+static void fe_mul121666(fe out, const fe a)
+{
+	fe k = { 121666, 0, 0, 0, 0 };
+	fe_mul(out, a, k);
+}
+
+static void fe_sq_n(fe out, const fe in, int n)
+{
+	int i;
+	fe_sq(out, in);
+	for (i = 1; i < n; i++)
+		fe_sq(out, out);
+}
+
+static void fe_inv(fe out, const fe z)
+{
+	fe a, t0, b, c;
+
+	fe_sq(a, z);
+	fe_sq_n(t0, a, 2);
+	fe_mul(b, t0, z);
+	fe_mul(a, b, a);
+	fe_sq(t0, a);
+	fe_mul(b, t0, b);
+	fe_sq_n(t0, b, 5);
+	fe_mul(b, t0, b);
+	fe_sq_n(t0, b, 10);
+	fe_mul(c, t0, b);
+	fe_sq_n(t0, c, 20);
+	fe_mul(t0, t0, c);
+	fe_sq_n(t0, t0, 10);
+	fe_mul(b, t0, b);
+	fe_sq_n(t0, b, 50);
+	fe_mul(c, t0, b);
+	fe_sq_n(t0, c, 100);
+	fe_mul(t0, t0, c);
+	fe_sq_n(t0, t0, 50);
+	fe_mul(t0, t0, b);
+	fe_sq_n(t0, t0, 5);
+	fe_mul(out, t0, a);
+
+	memzero_explicit(a, sizeof(a));
+	memzero_explicit(t0, sizeof(t0));
+	memzero_explicit(b, sizeof(b));
+	memzero_explicit(c, sizeof(c));
+}
+
+static void fe_cswap(fe a, fe b, limb swap)
+{
+	limb mask = -swap;
+	int i;
+	for (i = 0; i < 5; i++) {
+		limb t = mask & (a[i] ^ b[i]);
+		a[i] ^= t;
+		b[i] ^= t;
+	}
+}
+
+static const uint8_t curve25519_base[32] = { 9 };
+
+static void curve25519_scalar(uint8_t out[32], const uint8_t scalar[32],
+			      const uint8_t point[32])
+{
+	fe x1, x2, z2, x3, z3;
+	fe A, B, C, D, DA, CB, AA, BB, E;
+	uint8_t e[32];
+	limb s;
+	int i;
+
+	memcpy(e, scalar, 32);
+	e[0] &= 248;
+	e[31] &= 127;
+	e[31] |= 64;
+
+	fe_load(x1, point);
+	x2[0] = 1; x2[1] = 0; x2[2] = 0; x2[3] = 0; x2[4] = 0;
+	z2[0] = 0; z2[1] = 0; z2[2] = 0; z2[3] = 0; z2[4] = 0;
+	memcpy(x3, x1, 40);
+	z3[0] = 1; z3[1] = 0; z3[2] = 0; z3[3] = 0; z3[4] = 0;
+
+	for (i = 254; i >= 0; i--) {
+		s = (e[i >> 3] >> (i & 7)) & 1;
+		fe_cswap(x2, x3, s);
+		fe_cswap(z2, z3, s);
+
+		fe_add(A, x2, z2);
+		fe_sub(B, x2, z2);
+		fe_add(C, x3, z3);
+		fe_sub(D, x3, z3);
+
+		fe_mul(DA, D, A);
+		fe_mul(CB, C, B);
+
+		fe_add(x3, DA, CB);
+		fe_sq(x3, x3);
+		fe_sub(z3, DA, CB);
+		fe_sq(z3, z3);
+		fe_mul(z3, z3, x1);
+
+		fe_sq(AA, A);
+		fe_sq(BB, B);
+		fe_mul(x2, AA, BB);
+
+		fe_sub(E, AA, BB);
+		fe_mul121666(z2, E);
+		fe_add(z2, z2, AA);
+		fe_mul(z2, z2, E);
+
+		fe_cswap(x2, x3, s);
+		fe_cswap(z2, z3, s);
+	}
+
+	fe_inv(z3, z2);
+	fe_mul(x2, x2, z3);
+	fe_store(out, x2);
+
+	memzero_explicit(x1, sizeof(x1));
+	memzero_explicit(x2, sizeof(x2));
+	memzero_explicit(z2, sizeof(z2));
+	memzero_explicit(x3, sizeof(x3));
+	memzero_explicit(z3, sizeof(z3));
+	memzero_explicit(A, sizeof(A));
+	memzero_explicit(B, sizeof(B));
+	memzero_explicit(C, sizeof(C));
+	memzero_explicit(D, sizeof(D));
+	memzero_explicit(DA, sizeof(DA));
+	memzero_explicit(CB, sizeof(CB));
+	memzero_explicit(AA, sizeof(AA));
+	memzero_explicit(BB, sizeof(BB));
+	memzero_explicit(E, sizeof(E));
+	memzero_explicit(e, sizeof(e));
+}
+
 int tcps_dh_shared(const uint8_t my_private[32], const uint8_t peer_public[32],
 		   uint8_t shared[32])
 {
-	int ret = curve25519(shared, my_private, peer_public);
-	if (ret == 0) {
-		int i;
-		uint8_t z = 0;
-		for (i = 0; i < 32; i++)
-			z |= shared[i];
-		if (z == 0)
-			return -EINVAL;
-	}
-	return ret;
+	int i;
+	uint8_t z = 0;
+
+	curve25519_scalar(shared, my_private, peer_public);
+	for (i = 0; i < 32; i++)
+		z |= shared[i];
+	if (z == 0)
+		return -EINVAL;
+	return 0;
 }
 
 void tcps_gen_keypair(uint8_t private_key[32], uint8_t public_key[32])
 {
-	int tries = 0;
-	curve25519_generate_secret(private_key);
-	while (!curve25519_generate_public(public_key, private_key)) {
-		curve25519_generate_secret(private_key);
-		if (++tries > 16) {
-			memset(private_key, 0, 32);
-			memset(public_key, 0, 32);
-			return;
-		}
-	}
+	get_random_bytes(private_key, 32);
+	private_key[0] &= 248;
+	private_key[31] &= 127;
+	private_key[31] |= 64;
+	curve25519_scalar(public_key, private_key, curve25519_base);
+}
+
+int tcps_derive_public(const uint8_t private_key[32], uint8_t public_key[32])
+{
+	uint8_t clamped[32];
+	int i;
+	uint8_t z = 0;
+
+	memcpy(clamped, private_key, 32);
+	clamped[0] &= 248;
+	clamped[31] &= 127;
+	clamped[31] |= 64;
+	curve25519_scalar(public_key, clamped, curve25519_base);
+	memzero_explicit(clamped, sizeof(clamped));
+
+	for (i = 0; i < 32; i++)
+		z |= public_key[i];
+	if (z == 0)
+		return -EINVAL;
+	return 0;
 }
 
 struct poly1305_ctx {

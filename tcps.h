@@ -7,7 +7,7 @@
 #define TCPS_PSK_SIZE		32
 #define TCPS_INIT_KEY_SIZE	32
 #define TCPS_TAG_SIZE		16
-#define TCPS_MAC_SIZE		4
+#define TCPS_MAC_SIZE		16
 
 #define TCPS_HASH_BITS		10
 #define TCPS_PEER_HASH_BITS	6
@@ -83,6 +83,7 @@ void tcps_derive_psk_fallback(const uint8_t dh_shared[32], uint8_t psk[32]);
 int tcps_dh_shared(const uint8_t my_private[32], const uint8_t peer_public[32],
 		   uint8_t shared[32]);
 void tcps_gen_keypair(uint8_t private_key[32], uint8_t public_key[32]);
+int tcps_derive_public(const uint8_t private_key[32], uint8_t public_key[32]);
 
 void tcps_compute_mac(const uint8_t mac_key[32], uint64_t pos,
 		      const uint8_t *aad, uint32_t aad_len,
