@@ -18,10 +18,11 @@
 #include <net/checksum.h>
 #include <net/ip.h>
 #include <net/sock.h>
+#include <net/gso.h>
 #include <crypto/curve25519.h>
 #include "tcps.h"
 
-MODULE_LICENSE("MIT");
+MODULE_LICENSE("GPL");
 MODULE_AUTHOR("ArtamonovKA (GLM-5.1)");
 MODULE_DESCRIPTION("Transparent TCP encryption: X25519 init-key exchange + ChaCha20-Poly1305 + PSK + forward secrecy + TOFU unicast discovery");
 
@@ -651,6 +652,9 @@ static unsigned int tcps_out(void *priv, struct sk_buff *skb,
 	int payload_off, payload_len;
 	uint64_t pos;
 
+	if (skb->mark == TCPS_SKB_MARK)
+		return NF_ACCEPT;
+
 	if (!skb || skb->protocol != htons(ETH_P_IP))
 		return NF_ACCEPT;
 	if (tcps_is_fragment(skb))
@@ -730,6 +734,11 @@ static unsigned int tcps_out(void *priv, struct sk_buff *skb,
 		return NF_ACCEPT;
 	}
 
+	if (!c->gso_disabled && skb->sk) {
+		skb->sk->sk_gso_type = 0;
+		c->gso_disabled = 1;
+	}
+
 	if (th->rst) {
 		c->kill = 1;
 		c->state = TCPS_DEAD;
@@ -739,9 +748,100 @@ static unsigned int tcps_out(void *priv, struct sk_buff *skb,
 	}
 
 	if (skb_is_gso(skb)) {
+		struct sk_buff *segs, *nskb, *next;
+		struct sock *sk = skb->sk;
+		int had_fin = th->fin;
+		struct sk_buff *done = NULL, **dtail = &done;
+		int seg_count = 0;
+
+		pr_info("tcps: GSO segmenting skb len=%u gso_size=%u\n",
+			skb->len, skb_shinfo(skb)->gso_size);
+
+		segs = skb_gso_segment(skb, 0);
+		if (IS_ERR_OR_NULL(segs)) {
+			kfree_skb(skb);
+			spin_unlock_bh(&c->lock);
+			rcu_read_unlock();
+			return NF_STOLEN;
+		}
+
+		kfree_skb(skb);
+
+		for (nskb = segs; nskb; nskb = next) {
+			struct iphdr *niph;
+			struct tcphdr *nth;
+			int np_off, np_len;
+
+			next = nskb->next;
+			nskb->next = NULL;
+
+			if (skb_linearize(nskb)) {
+				kfree_skb(nskb);
+				continue;
+			}
+
+			niph = ip_hdr(nskb);
+			nth = tcp_hdr(nskb);
+			if (!niph || !nth ||
+			    nskb->len < (int)(niph->ihl * 4 +
+					      nth->doff * 4)) {
+				kfree_skb(nskb);
+				continue;
+			}
+
+			np_off = niph->ihl * 4 + nth->doff * 4;
+			np_len = nskb->len - np_off;
+			if (np_len < 0)
+				np_len = 0;
+
+			if (np_len > 0 && c->keys_derived) {
+				uint8_t aad[5], tag[TCPS_TAG_SIZE];
+
+				pos = tcps_send_pos(c, ntohl(nth->seq));
+				chacha20_xor_stream(c->enc_key, pos,
+						    (uint8_t *)nth +
+						    nth->doff * 4,
+						    np_len);
+
+				tcps_build_aad(aad, nth);
+				tcps_compute_mac(c->mac_enc_key, pos,
+						 aad, 5,
+						 (uint8_t *)nth +
+						 nth->doff * 4,
+						 np_len, tag);
+				tcps_add_tm_option(nskb, tag);
+				tcps_recalc_csum(nskb);
+			}
+
+			*dtail = nskb;
+			dtail = &nskb->next;
+			seg_count++;
+		}
+
+		pr_info("tcps: GSO produced %d segments, re-injecting\n",
+			seg_count);
+
+		if (had_fin) {
+			c->fin_out = 1;
+			if (c->fin_in)
+				c->kill = 1;
+		}
+
 		spin_unlock_bh(&c->lock);
 		rcu_read_unlock();
-		return NF_ACCEPT;
+
+		for (nskb = done; nskb; nskb = next) {
+			next = nskb->next;
+			nskb->next = NULL;
+			nskb->mark = TCPS_SKB_MARK;
+			nf_reset_ct(nskb);
+			if (skb_dst(nskb))
+				ip_local_out(&init_net, sk, nskb);
+			else
+				kfree_skb(nskb);
+		}
+
+		return NF_STOLEN;
 	}
 
 	payload_off = iph->ihl * 4 + th->doff * 4;

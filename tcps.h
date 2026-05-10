@@ -38,6 +38,7 @@ struct tcps_conn {
 	int fin_in, fin_out;
 	int kill;
 	int keys_derived;
+	int gso_disabled;
 	int peer_has_mac;
 
 	unsigned long last_active;
@@ -58,6 +59,8 @@ struct tcps_peer {
 	struct hlist_node hnode;
 	struct rcu_head rcu;
 };
+
+#define TCPS_SKB_MARK		0x54435053
 
 #define TCPS_DISC_TYPE_DISCOVER		0x01
 #define TCPS_DISC_TYPE_KEYXCHG		0x02

@@ -7,7 +7,7 @@
 tcps/
 ├── v3/                        # Текущая версия (X25519 init-key exchange + ChaCha20-Poly1305 + PSK + forward secrecy)
 │   ├── tcps.h                 # Заголовок: состояния, константы, ChaCha20, Poly1305, X25519, PSK, ct_memcmp
-│   ├── tcps_main.c            # Netfilter hooks, probe/TM options, TOFU unicast discovery, PSK verify, key rotation
+│   ├── tcps_main.c            # Netfilter hooks, probe/TM options, TOFU unicast discovery, PSK verify, key rotation, GSO handling
 │   ├── tcps_crypto.c          # ChaCha20 stream cipher + Poly1305 MAC + X25519 DH + KDF + PSK derivation
 │   └── Makefile               # Сборка: make → tcps.ko
 ```
@@ -25,7 +25,7 @@ tcps/
 7. Работает для всех TCP-сокетов на системе, приложения ничего не знают
 8. Порты из `skip_ports` (по умолчанию 22) пропускаются — SSH/SCP работают без модификации
 9. Loopback-соединения (127.x.x.x) пропускаются
-10. GSO-пакеты пропускаются целиком (невозможно аутентифицировать без тега в каждом сегменте)
+10. GSO-пакеты обрабатываются: GSO отключается на сокете (`sk_gso_type=0`), при race window — программная сегментация + шифрование каждого сегмента
 
 # Init-key exchange — протокол обмена ключами
 
@@ -110,7 +110,7 @@ tcps/
 
 **Поведение:**
 - TM option НЕ удаляется при приёме — TCP stack игнорирует неизвестный kind=253
-- GSO-пакеты пропускаются целиком (без шифрования и MAC) — нельзя аутентифицировать сегменты
+- GSO-пакеты: `sk_gso_type=0` отключает GSO на сокете; fallback — `skb_gso_segment()` + шифрование каждого сегмента + `ip_local_out()` с mark для защиты от зацикливания
 - RST без MAC в KEYED-состоянии → DROP (защита от инъекции)
 - Данные без MAC после `peer_has_mac` → DROP (защита от bit-flipping)
 
@@ -214,6 +214,27 @@ insmod tcps.ko skip_ports=22,443 strict_tofu=1 psk_require_verify=1 key_file=/et
 cat /sys/module/tcps/parameters/psk_require_verify
 echo 1 > /sys/module/tcps/parameters/psk_require_verify
 ```
+
+# GSO-обработка (Generic Segmentation Offload)
+
+**Проблема:** GSO позволяет TCP создавать большие сегменты (до 64KB), которые сегментируются NIC или ядром ПОСЛЕ netfilter hook. Невозможно аутентифицировать (MAC) сегменты, которых ещё не существует.
+
+**Решение — комбинированный подход (Вариант В):**
+
+1. **Первичный механизм:** При первом KEYED-пакете устанавливается `sk->sk_gso_type = 0` — TCP перестаёт создавать GSO-сегменты для данного сокета. Все пакеты приходят MSS-размера (1460B) и шифруются через обычный путь.
+
+2. **Fallback (race window):** Если GSO-пакет успел создаться до установки `sk_gso_type=0`:
+   - `skb_gso_segment(skb, 0)` — программная сегментация на MSS-размеры
+   - Каждый сегмент линеаризуется, шифруется ChaCha20, подписывается Poly1305 MAC (TM option)
+   - Сегменты реинжектируются через `ip_local_out()` с `skb->mark = TCPS_SKB_MARK` для защиты от зацикливания
+   - Оригинальный GSO skb освобождается (`NF_STOLEN`)
+
+**Производительность:** Отключение GSO увеличивает количество пакетов в стеке (каждый 64KB GSO → ~44 MSS-пакета). Тесты показывают:
+- curl 50MB: ~200MB/s
+- scp 200MB: ~183MB/s
+- При rate >500Mbps снижение throughput может быть заметно
+
+**Проверка:** В dmesg отсутствие `GSO segmenting` = первичный механизм работает (GSO отключён до создания пакетов).
 
 # Probe option — обнаружение поддержки TCPS
 
@@ -353,7 +374,7 @@ TCP option kind=253 (экспериментальный диапазон RFC 472
 |---|-----------|-------------|
 | H-1 | PSK читается без блокировки (torn read при ротации) | `spin_lock(&tcps_peers_lock)` в `tcps_peer_get_psk()` |
 | H-2 | Нет проверки all-zero DH shared secret (low-order point attack) | `tcps_dh_shared()` возвращает -EINVAL для all-zero |
-| H-3 | GSO пакеты шифруются без MAC (bit-flipping) | GSO пакеты полностью пропускаются (NF_ACCEPT без шифрования) |
+| H-3 | GSO пакеты шифруются без MAC (bit-flipping) | GSO отключается на сокете (`sk_gso_type=0`); fallback — `skb_gso_segment()` + шифрование каждого сегмента |
 | H-4 | `spin_lock` вместо `spin_lock_bh` в `tcps_in` → deadlock | Все блокировки в `tcps_in` → `spin_lock_bh` |
 | H-5 | Дублирование соединений при SYN retransmit (memory leak) | `tcps_conn_add_unique()` — lookup перед add |
 | H-6 | seq wrap на 4GB → keystream reuse (two-time pad) | `enc_seq_hi`/`dec_seq_hi` отслеживают 32-битный wrap |
@@ -522,7 +543,7 @@ tcpdump -i ens18 -A -s0 tcp
 | Auto-discovery | TOFU unicast discovery (порт 54321), триггер от SYN |
 | Skip ports | Порт 22 пропускается — SSH/SCP не затрагиваются |
 | Skip loopback | 127.x.x.x пропускается — локальные соединения не шифруются |
-| Skip GSO | GSO-пакеты не шифруются (нельзя аутентифицировать) |
+| GSO handled | GSO отключается на сокете (`sk_gso_type=0`), fallback сегментация + шифрование |
 | Seq wrap | 32-bit wraparound отслеживается (seq_hi) → нет keystream reuse |
 | Duplicate conn | `tcps_conn_add_unique()` — нет дубликатов при SYN retransmit |
 | Peer limit | Max 64 пира (TCPS_MAX_PEERS) — защита от OOM |
@@ -534,7 +555,7 @@ tcpdump -i ens18 -A -s0 tcp
 | Ограничение | Описание |
 |-------------|----------|
 | IPv4 only | IPv6 пока не поддерживается |
-| GSO без шифрования | GSO-пакеты пропускаются целиком (нельзя аутентифицировать сегменты) |
+| GSO снижение throughput | Без GSO больше пакетов в стеке, но весь трафик шифруется; при rate >500Mbps заметно |
 | MAC 4 байта | Усечённый Poly1305 тег (2^32 forgery), полный 16B не влезет в TCP option |
 | First-use MITM | Первый обмен уязвим к MITM (обнаруживается через fingerprint) |
 | PSK verify ручной | Оператор должен сравнить fingerprint на обеих машинах |
