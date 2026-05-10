@@ -10,9 +10,6 @@ tcps/
 │   ├── tcps_main.c            # Netfilter hooks, probe option, TOFU unicast discovery, PSK verify, key rotation, GSO, rate-limit
 │   ├── tcps_crypto.c          # ChaCha20 + Poly1305 + X25519 (self-contained, __int128) + KDF + PSK derivation
 │   └── Makefile               # Сборка: make → tcps.ko
-├── v2/                        # X25519 DH + ChaCha20 + TOFU (без init-key exchange)
-├── kernel/                    # Старая v1 (сломана на GSO, не используется)
-└── README.md
 ```
 
 # Как работает
